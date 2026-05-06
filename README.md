@@ -1,16 +1,41 @@
 # High Performance Logger
 
-一个独立实现的 C++20 高性能异步日志库，设计思路参考 `spdlog`，但把热路径上的互斥锁替换成了基于 CAS 的无锁环形队列。
+![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C)
+![CMake](https://img.shields.io/badge/build-CMake-064F8C)
+![Async Logging](https://img.shields.io/badge/design-async%20logging-0A7E8C)
+![Lock Free Queue](https://img.shields.io/badge/concurrency-lock--free%20queue-BF5B04)
 
-## 设计目标
+A C++20 high-performance asynchronous logging library inspired by `spdlog`, built around a CAS-based lock-free ring buffer instead of a `mutex`-protected queue.
 
-- 异步写入：业务线程只负责构造日志并入队，后台线程统一落盘
-- 多线程安全：支持多生产者并发写日志、单消费者顺序刷盘
-- 日志分级：支持 `trace/debug/info/warn/error/critical/off`
-- 低锁开销：入队/出队使用 CAS 原子操作，不在热路径上使用 `std::mutex`
-- 可控背压：队列满时支持阻塞等待或丢弃新日志两种策略
+一个参考 `spdlog` 设计实现的 C++20 高性能异步日志库，核心热路径使用基于 CAS 的无锁环形队列替代 `mutex` 队列，重点解决高并发日志写入下的锁竞争问题。
 
-## 架构
+## Resume Snapshot
+
+- Built a C++20 asynchronous logger with a layered `logger + sink + background worker` architecture, supporting log levels, async flushing, and pluggable sinks.
+- Replaced a `mutex + condition_variable` queue with a CAS-based bounded lock-free ring buffer and `atomic::wait/notify`, reducing contention on the logging hot path.
+- Benchmarked against a mutex-based async baseline on the same workload; in one `8-thread / 160000-message` run, throughput improved from about `4.73e5 msg/s` to `3.09e6 msg/s`, a gain of about `554%`.
+
+## Why This Project
+
+Synchronous logging is easy to write but becomes a bottleneck under contention:
+
+- producer threads serialize on a shared lock
+- queue nodes trigger repeated allocations
+- frequent wakeups add coordination overhead
+- log spikes can push both latency and memory usage upward
+
+This project isolates those costs and optimizes the hot path with a bounded ring buffer, a single consumer thread, and atomic wake/flush coordination.
+
+## Core Features
+
+- Asynchronous write path: producer threads only format and enqueue log messages; a background worker performs ordered sink writes.
+- Multi-thread safety: supports multiple concurrent producers and a single consumer sink thread.
+- Log levels: `trace/debug/info/warn/error/critical/off`.
+- Low-overhead concurrency: enqueue/dequeue use CAS instead of `std::mutex` on the hot path.
+- Overflow handling: supports `Block` and `DropNewest` policies when the queue is full.
+- Flush coordination: supports explicit `Flush()` with atomic ticket-based synchronization.
+
+## Architecture
 
 ```text
 producer threads
@@ -18,6 +43,7 @@ producer threads
       v
 AsyncLogger
   - level filter
+  - payload formatting
   - CAS ring buffer
   - atomic wake/flush
       |
@@ -28,34 +54,90 @@ background worker
 Sink (FileSink / custom sink)
 ```
 
-核心组件：
+Key components:
 
-- `hlog::LockFreeRingBuffer<T>`：基于每个槽位的 sequence number 实现有界无锁队列
-- `hlog::AsyncLogger`：对外提供日志 API、等级过滤、异步消费和 flush 协调
-- `hlog::Sink`：抽象输出端
-- `hlog::FileSink`：后台线程独占文件句柄，顺序写盘
+- `hlog::LockFreeRingBuffer<T>`: bounded MPSC-style queue using per-slot sequence numbers.
+- `hlog::AsyncLogger`: public logging API, level filtering, async publish, flush, and statistics.
+- `hlog::Sink`: sink abstraction for output destinations.
+- `hlog::FileSink`: single-consumer ordered file writer.
 
-## 关键实现点
+## Design Decisions
 
-### 1. CAS 无锁队列
+### 1. Why a bounded ring buffer
 
-- 使用类似 Dmitry Vyukov bounded queue 的思路
-- `enqueue_pos_ / dequeue_pos_` 通过 `compare_exchange_weak` 抢占槽位
-- 每个槽位维护独立 `sequence`，避免 ABA 式误判和额外锁竞争
+- Pre-allocates storage to avoid per-message node allocation in the hot path.
+- Keeps memory usage bounded during traffic spikes.
+- Uses power-of-two capacity so index wrapping can use bit masking instead of modulo.
 
-### 2. 异步唤醒
+### 2. Why CAS instead of mutex
 
-- 生产者入队后递增 `wake_signal_`
-- 消费线程用 `atomic::wait/notify_one` 休眠与唤醒
-- 相比 `condition_variable + mutex`，少一次显式加锁路径
+- Multiple producers compete only on atomic cursor updates, not a shared critical section.
+- Reduces convoying under contention compared with `std::mutex + std::condition_variable`.
+- Sequence numbers on each slot distinguish ready/full states without extra locks.
 
-### 3. Flush 同步
+### 3. Why a single sink consumer
 
-- `Flush()` 会投递一个控制消息
-- 后台线程完成刷盘后更新 `flush_complete_ticket_`
-- 调用线程通过原子等待拿到 flush 完成信号
+- File writes remain ordered.
+- Sink implementations avoid extra write-side locking.
+- The concurrency problem is isolated to the queue rather than mixing queue contention with sink contention.
 
-## 构建
+### 4. How thread safety is handled
+
+- Producers publish `QueueItem` objects through `compare_exchange_weak`.
+- The worker drains the queue and owns sink writes.
+- `Flush()` sends a control message and waits on an atomic completion ticket.
+- Wakeups use `atomic::wait/notify` rather than a separate condition-variable lock path.
+
+## Performance Comparison
+
+`hlog_compare_benchmark` compares two async designs under the same workload and with the same in-memory sink:
+
+- `mutex_async_logger`: `std::mutex + std::condition_variable + std::deque`
+- `cas_async_logger`: CAS lock-free ring buffer + `atomic::wait/notify`
+
+Sample command:
+
+```bash
+./build/hlog_compare_benchmark 8 20000
+```
+
+Sample result on the current machine:
+
+| Implementation | Throughput |
+| --- | ---: |
+| `mutex_async_logger` | `4.73e5 msg/s` |
+| `cas_async_logger` | `3.09e6 msg/s` |
+| Improvement | `+554%` |
+
+Notes:
+
+- This benchmark intentionally uses an in-memory sink to isolate queueing and synchronization overhead from disk I/O.
+- Absolute numbers depend on CPU, compiler, and optimization flags; the important signal is the scalability trend under contention.
+
+## Repository Layout
+
+```text
+include/hlog/
+  async_logger.h
+  file_sink.h
+  lock_free_ring_buffer.h
+  log_level.h
+  log_message.h
+  sink.h
+src/
+  async_logger.cpp
+  file_sink.cpp
+examples/
+  basic_example.cpp
+  benchmark_main.cpp
+  compare_benchmark.cpp
+tests/
+  async_logger_test.cpp
+docs/
+  resume-kit.md
+```
+
+## Build And Run
 
 ```bash
 cmake -S . -B build
@@ -63,7 +145,7 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-## 运行示例
+Examples:
 
 ```bash
 ./build/hlog_example
@@ -71,34 +153,30 @@ ctest --test-dir build --output-on-failure
 ./build/hlog_compare_benchmark
 ```
 
-日志默认输出到工程目录下的 `example.log` 和 `benchmark.log`。
+Generated logs are written to `example.log` and `benchmark.log`.
 
-## 性能对比
+## Tests
 
-`hlog_compare_benchmark` 使用同样的异步模型和同样的内存 sink，对比两种队列实现：
+The test suite covers:
 
-- `mutex_async_logger`：`std::mutex + std::condition_variable + std::deque`
-- `cas_async_logger`：CAS 无锁环形队列 + `atomic::wait/notify`
+- level filtering correctness
+- concurrent asynchronous writes
+- overflow behavior under `DropNewest`
 
-示例命令：
+Run:
 
 ```bash
-./build/hlog_compare_benchmark 8 20000
+ctest --test-dir build --output-on-failure
 ```
 
-我在当前机器上的一次样例结果：
+## Chinese Project Introduction
 
-- `mutex_async_logger`：约 `4.73e5 msg/s`
-- `cas_async_logger`：约 `3.09e6 msg/s`
-- 吞吐提升：约 `554%`
+这是一个面向高并发场景的 C++20 异步日志库，设计上参考 `spdlog`，但针对日志热路径做了更聚焦的并发优化。项目使用基于 CAS 的有界无锁环形队列承接多线程日志写入，通过后台线程异步刷盘，并提供日志分级、阻塞/丢弃两种背压策略以及显式 `Flush()` 同步机制。为了验证优化是否真实有效，项目额外实现了与 `mutex + condition_variable` 异步队列的同模型对照 benchmark，在 `8` 线程 `160000` 条日志写入场景下，吞吐从约 `4.73e5 msg/s` 提升到约 `3.09e6 msg/s`。
 
-说明：
+## English Project Introduction
 
-- 这个对比刻意去掉磁盘 I/O 干扰，主要观察并发入队和线程唤醒开销
-- 绝对数值依赖机器配置和编译选项，但趋势能反映锁竞争和扩展性差异
+This project is a C++20 asynchronous logging library for high-concurrency workloads. Inspired by `spdlog`, it focuses on optimizing the logging hot path with a CAS-based bounded lock-free ring buffer, a background sink thread, log-level filtering, explicit flush coordination, and configurable overflow policies. To make the optimization measurable rather than anecdotal, the repository also includes a like-for-like benchmark against a `mutex + condition_variable` async baseline. In one `8-thread / 160000-message` run on the current machine, throughput improved from roughly `4.73e5 msg/s` to `3.09e6 msg/s`.
 
-## 简历可写表述
+## Resume / Interview Materials
 
-- 参考 `spdlog` 独立实现 C++20 高性能异步日志库，设计 `logger + sink + worker thread` 分层架构，支持多线程安全、日志分级、异步落盘与自定义输出端
-- 使用基于 CAS 的无锁环形队列替代互斥锁队列，结合 `atomic::wait/notify` 实现低开销线程通信，降低高并发日志写入路径上的锁竞争
-- 设计阻塞/丢弃两种队列满载策略，并补充并发测试与基准程序验证吞吐和正确性
+Shorter resume-ready and interview-ready descriptions are collected in [docs/resume-kit.md](docs/resume-kit.md).
