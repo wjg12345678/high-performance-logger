@@ -1,11 +1,15 @@
-#include "hlog/async_logger.h"
 #include "benchmark_support.h"
+#include "hlog/async_logger.h"
+
+#include <spdlog/async.h>
+#include <spdlog/details/null_mutex.h>
+#include <spdlog/sinks/base_sink.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
-#include <functional>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -15,6 +19,65 @@
 #include <vector>
 
 namespace {
+
+class CountingSpdlogSink final : public spdlog::sinks::base_sink<spdlog::details::null_mutex> {
+public:
+  std::uint64_t written() const {
+    return written_.load(std::memory_order_relaxed);
+  }
+
+protected:
+  void sink_it_(const spdlog::details::log_msg&) override {
+    written_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  void flush_() override {}
+
+private:
+  std::atomic<std::uint64_t> written_{0};
+};
+
+class SpdlogAsyncLogger {
+public:
+  SpdlogAsyncLogger() {
+    sink_ = std::make_shared<CountingSpdlogSink>();
+    thread_pool_ = std::make_shared<spdlog::details::thread_pool>(1 << 15, 1);
+    logger_ = std::make_shared<spdlog::async_logger>(
+        "spdlog-benchmark",
+        sink_,
+        thread_pool_,
+        spdlog::async_overflow_policy::block);
+    logger_->set_level(spdlog::level::info);
+    logger_->flush_on(spdlog::level::off);
+  }
+
+  void Log(const std::string& payload) {
+    logger_->info(payload);
+  }
+
+  void Flush() {
+    if (!stopped_) {
+      logger_->flush();
+      logger_.reset();
+      thread_pool_.reset();
+      stopped_ = true;
+    }
+  }
+
+  std::uint64_t written() const {
+    return sink_->written();
+  }
+
+  void Stop() {
+    Flush();
+  }
+
+private:
+  std::shared_ptr<CountingSpdlogSink> sink_;
+  std::shared_ptr<spdlog::details::thread_pool> thread_pool_;
+  std::shared_ptr<spdlog::async_logger> logger_;
+  bool stopped_ = false;
+};
 
 struct BenchmarkResult {
   std::string name;
@@ -199,17 +262,16 @@ int main(int argc, char** argv) {
             << " warmup_rounds=" << warmup_rounds
             << '\n';
 
-  const auto mutex_factory = []() {
-    return std::make_unique<hlog_bench::MutexAsyncLogger>(
-        std::make_unique<hlog_bench::CountingSink>());
+  const auto spdlog_factory = []() {
+    return std::make_unique<SpdlogAsyncLogger>();
   };
-  const auto mutex_log = [](hlog_bench::MutexAsyncLogger& logger, int thread_id, int index) {
+  const auto spdlog_log = [](SpdlogAsyncLogger& logger, int thread_id, int index) {
     logger.Log(hlog_bench::MakePayload(thread_id, index));
   };
-  const auto mutex_flush = [](hlog_bench::MutexAsyncLogger& logger) {
+  const auto spdlog_flush = [](SpdlogAsyncLogger& logger) {
     logger.Flush();
   };
-  const auto mutex_written = [](hlog_bench::MutexAsyncLogger& logger) {
+  const auto spdlog_written = [](SpdlogAsyncLogger& logger) {
     return logger.written();
   };
 
@@ -239,13 +301,13 @@ int main(int argc, char** argv) {
         "warmup",
         round,
         RunBenchmark(
-            "mutex_async_logger",
+            "spdlog_async_logger",
             thread_count,
             messages_per_thread,
-            mutex_factory,
-            mutex_log,
-            mutex_flush,
-            mutex_written));
+            spdlog_factory,
+            spdlog_log,
+            spdlog_flush,
+            spdlog_written));
     PrintRoundResult(
         "warmup",
         round,
@@ -259,15 +321,15 @@ int main(int argc, char** argv) {
             cas_written));
   }
 
-  const auto mutex_results = RunBenchmarks(
+  const auto spdlog_results = RunBenchmarks(
       measured_rounds,
-      "mutex_async_logger",
+      "spdlog_async_logger",
       thread_count,
       messages_per_thread,
-      mutex_factory,
-      mutex_log,
-      mutex_flush,
-      mutex_written);
+      spdlog_factory,
+      spdlog_log,
+      spdlog_flush,
+      spdlog_written);
 
   const auto cas_results = RunBenchmarks(
       measured_rounds,
@@ -279,15 +341,15 @@ int main(int argc, char** argv) {
       cas_flush,
       cas_written);
 
-  const auto mutex_summary = Summarize(mutex_results);
+  const auto spdlog_summary = Summarize(spdlog_results);
   const auto cas_summary = Summarize(cas_results);
-  PrintSummary(mutex_summary);
+  PrintSummary(spdlog_summary);
   PrintSummary(cas_summary);
 
-  if (mutex_summary.median_throughput > 0.0) {
+  if (spdlog_summary.median_throughput > 0.0) {
     const double improvement =
-        (cas_summary.median_throughput - mutex_summary.median_throughput) /
-        mutex_summary.median_throughput * 100.0;
+        (cas_summary.median_throughput - spdlog_summary.median_throughput) /
+        spdlog_summary.median_throughput * 100.0;
     std::cout << "improvement_percent_median=" << improvement << '\n';
   }
 

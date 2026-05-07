@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="420" viewBox="0 0 900 420">
+<style>
+text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #16324f; }
+.title { font-size: 20px; font-weight: 700; }
+.axis-label { font-size: 12px; font-weight: 600; }
+.tick { font-size: 11px; fill: #49617b; }
+.grid { stroke: #d7e1ec; stroke-width: 1; }
+.axis { stroke: #35506b; stroke-width: 1.5; }
+.legend { font-size: 12px; font-weight: 600; }
+</style>
+<rect width="100%" height="100%" fill="#f7fbff" rx="12" ry="12"/>
+<text x="80" y="28" class="title">Median Throughput by Thread Count</text>
+<text x="450.0" y="406" text-anchor="middle" class="axis-label">Threads</text>
+<text x="20" y="206.0" transform="rotate(-90 20 206.0)" class="axis-label">Messages per second</text>
+<line x1="80" y1="364.0" x2="876" y2="364.0" class="grid"/>
+<text x="70" y="368.0" text-anchor="end" class="tick">0</text>
+<line x1="80" y1="300.8" x2="876" y2="300.8" class="grid"/>
+<text x="70" y="304.8" text-anchor="end" class="tick">1.21M</text>
+<line x1="80" y1="237.6" x2="876" y2="237.6" class="grid"/>
+<text x="70" y="241.6" text-anchor="end" class="tick">2.41M</text>
+<line x1="80" y1="174.4" x2="876" y2="174.4" class="grid"/>
+<text x="70" y="178.4" text-anchor="end" class="tick">3.62M</text>
+<line x1="80" y1="111.2" x2="876" y2="111.2" class="grid"/>
+<text x="70" y="115.2" text-anchor="end" class="tick">4.83M</text>
+<line x1="80" y1="48.0" x2="876" y2="48.0" class="grid"/>
+<text x="70" y="52.0" text-anchor="end" class="tick">6.04M</text>
+<line x1="80" y1="48" x2="80" y2="364" class="axis"/>
+<line x1="80" y1="364" x2="876" y2="364" class="axis"/>
+<line x1="80.0" y1="364" x2="80.0" y2="370" class="axis"/>
+<text x="80.0" y="386" text-anchor="middle" class="tick">1</text>
+<line x1="279.0" y1="364" x2="279.0" y2="370" class="axis"/>
+<text x="279.0" y="386" text-anchor="middle" class="tick">2</text>
+<line x1="478.0" y1="364" x2="478.0" y2="370" class="axis"/>
+<text x="478.0" y="386" text-anchor="middle" class="tick">4</text>
+<line x1="677.0" y1="364" x2="677.0" y2="370" class="axis"/>
+<text x="677.0" y="386" text-anchor="middle" class="tick">8</text>
+<line x1="876.0" y1="364" x2="876.0" y2="370" class="axis"/>
+<text x="876.0" y="386" text-anchor="middle" class="tick">16</text>
+<line x1="636" y1="24" x2="654" y2="24" stroke="#c84c09" stroke-width="3"/>
+<circle cx="645" cy="24" r="3.5" fill="#c84c09"/>
+<text x="664" y="28" class="legend">mutex + condition_variable</text>
+<line x1="636" y1="46" x2="654" y2="46" stroke="#007f5f" stroke-width="3"/>
+<circle cx="645" cy="46" r="3.5" fill="#007f5f"/>
+<text x="664" y="50" class="legend">CAS ring buffer</text>
+<polyline fill="none" stroke="#c84c09" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" points="80.0,192.1 279.0,283.8 478.0,273.8 677.0,291.7 876.0,287.3"/>
+<circle cx="80.0" cy="192.1" r="4" fill="#c84c09"/>
+<text x="80.0" y="182.1" text-anchor="middle" class="tick">3.28M</text>
+<circle cx="279.0" cy="283.8" r="4" fill="#c84c09"/>
+<text x="279.0" y="273.8" text-anchor="middle" class="tick">1.53M</text>
+<circle cx="478.0" cy="273.8" r="4" fill="#c84c09"/>
+<text x="478.0" y="263.8" text-anchor="middle" class="tick">1.72M</text>
+<circle cx="677.0" cy="291.7" r="4" fill="#c84c09"/>
+<text x="677.0" y="281.7" text-anchor="middle" class="tick">1.38M</text>
+<circle cx="876.0" cy="287.3" r="4" fill="#c84c09"/>
+<text x="876.0" y="277.3" text-anchor="middle" class="tick">1.47M</text>
+<polyline fill="none" stroke="#007f5f" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" points="80.0,213.7 279.0,172.7 478.0,76.7 677.0,136.1 876.0,165.9"/>
+<circle cx="80.0" cy="213.7" r="4" fill="#007f5f"/>
+<text x="80.0" y="203.7" text-anchor="middle" class="tick">2.87M</text>
+<circle cx="279.0" cy="172.7" r="4" fill="#007f5f"/>
+<text x="279.0" y="162.7" text-anchor="middle" class="tick">3.66M</text>
+<circle cx="478.0" cy="76.7" r="4" fill="#007f5f"/>
+<text x="478.0" y="66.7" text-anchor="middle" class="tick">5.49M</text>
+<circle cx="677.0" cy="136.1" r="4" fill="#007f5f"/>
+<text x="677.0" y="126.1" text-anchor="middle" class="tick">4.35M</text>
+<circle cx="876.0" cy="165.9" r="4" fill="#007f5f"/>
+<text x="876.0" y="155.9" text-anchor="middle" class="tick">3.79M</text>
+</svg>

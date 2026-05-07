@@ -25,6 +25,7 @@ AsyncLogger::~AsyncLogger() {
 }
 
 bool AsyncLogger::Flush() {
+  OperationGuard guard(*this);
   if (!worker_.joinable()) {
     return false;
   }
@@ -80,11 +81,13 @@ const std::string& AsyncLogger::name() const {
 }
 
 LoggerStats AsyncLogger::Stats() const {
+  const std::uint64_t enqueued = enqueued_.load(std::memory_order_relaxed);
+  const std::uint64_t written = written_.load(std::memory_order_relaxed);
   return LoggerStats{
-      enqueued_.load(std::memory_order_relaxed),
+      enqueued,
       dropped_.load(std::memory_order_relaxed),
-      written_.load(std::memory_order_relaxed),
-      pending_items_.load(std::memory_order_relaxed),
+      written,
+      enqueued >= written ? enqueued - written : 0,
   };
 }
 
@@ -92,12 +95,12 @@ bool AsyncLogger::Publish(QueueItem&& item, bool block_on_full) {
   const bool count_as_log = item.type == QueueItemType::Log;
   std::uint32_t attempts = 0;
 
+  if (count_as_log) {
+    enqueued_.fetch_add(1, std::memory_order_relaxed);
+  }
+
   while (running_.load(std::memory_order_acquire) || (!stopping_.load(std::memory_order_acquire) && block_on_full)) {
     if (queue_.TryEnqueue(std::move(item))) {
-      pending_items_.fetch_add(1, std::memory_order_release);
-      if (count_as_log) {
-        enqueued_.fetch_add(1, std::memory_order_relaxed);
-      }
       wake_signal_.fetch_add(1, std::memory_order_acq_rel);
       wake_signal_.notify_one();
       return true;
@@ -105,6 +108,7 @@ bool AsyncLogger::Publish(QueueItem&& item, bool block_on_full) {
 
     if (!block_on_full) {
       if (count_as_log) {
+        enqueued_.fetch_sub(1, std::memory_order_relaxed);
         dropped_.fetch_add(1, std::memory_order_relaxed);
       }
       return false;
@@ -121,7 +125,19 @@ bool AsyncLogger::Publish(QueueItem&& item, bool block_on_full) {
     std::this_thread::sleep_for(std::chrono::microseconds(50));
   }
 
+  if (count_as_log) {
+    enqueued_.fetch_sub(1, std::memory_order_relaxed);
+  }
   return false;
+}
+
+void AsyncLogger::FinishOperation() {
+  const std::uint64_t remaining =
+      active_operations_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+  if (remaining == 0 && stopping_.load(std::memory_order_acquire)) {
+    wake_signal_.fetch_add(1, std::memory_order_acq_rel);
+    wake_signal_.notify_all();
+  }
 }
 
 bool AsyncLogger::HandleItem(const QueueItem& item) {
@@ -144,24 +160,28 @@ void AsyncLogger::WorkerLoop() {
 
     while (queue_.TryDequeue(item)) {
       flush_required = HandleItem(item) || flush_required;
-      pending_items_.fetch_sub(1, std::memory_order_acq_rel);
     }
 
     if (flush_required) {
       sink_->Flush();
     }
 
+    const std::uint64_t signal = wake_signal_.load(std::memory_order_acquire);
+
+    if (queue_.TryDequeue(item)) {
+      flush_required = HandleItem(item);
+      if (flush_required) {
+        sink_->Flush();
+      }
+      continue;
+    }
+
     if (stopping_.load(std::memory_order_acquire) &&
-        pending_items_.load(std::memory_order_acquire) == 0) {
+        active_operations_.load(std::memory_order_acquire) == 0) {
       break;
     }
 
-    const std::uint64_t signal = wake_signal_.load(std::memory_order_acquire);
-    if (pending_items_.load(std::memory_order_acquire) == 0 &&
-        !(stopping_.load(std::memory_order_acquire) &&
-          pending_items_.load(std::memory_order_acquire) == 0)) {
-      wake_signal_.wait(signal, std::memory_order_relaxed);
-    }
+    wake_signal_.wait(signal, std::memory_order_relaxed);
   }
 
   sink_->Flush();

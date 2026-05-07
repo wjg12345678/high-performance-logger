@@ -1,11 +1,11 @@
-#include "hlog/async_logger.h"
 #include "benchmark_support.h"
+#include "hlog/async_logger.h"
+#include "hlog/file_sink.h"
 
 #include <algorithm>
 #include <chrono>
-#include <cstdint>
 #include <cstdlib>
-#include <functional>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -60,24 +60,39 @@ double Median(std::vector<double> values) {
   return values[middle];
 }
 
-template <typename LoggerFactory, typename LogFn, typename FlushFn, typename WrittenFn>
 BenchmarkResult RunBenchmark(
     std::string name,
+    const hlog::FileSinkOptions& sink_options,
     int thread_count,
-    int messages_per_thread,
-    LoggerFactory&& factory,
-    LogFn&& log_fn,
-    FlushFn&& flush_fn,
-    WrittenFn&& written_fn) {
-  auto logger = factory();
-  const auto start = std::chrono::steady_clock::now();
+    int messages_per_thread) {
+  const auto path =
+      std::filesystem::temp_directory_path() / (name + "_benchmark.log");
+  std::filesystem::remove(path);
 
+  hlog::AsyncLoggerOptions options;
+  options.queue_size = 1 << 15;
+  options.overflow_policy = hlog::OverflowPolicy::Block;
+  options.level = hlog::LogLevel::Info;
+  options.flush_level = hlog::LogLevel::Off;
+
+  hlog::AsyncLogger logger(
+      std::move(name),
+      std::make_unique<hlog::FileSink>(path.string(), sink_options),
+      options);
+
+  const auto start = std::chrono::steady_clock::now();
   std::vector<std::thread> producers;
   producers.reserve(thread_count);
   for (int thread_id = 0; thread_id < thread_count; ++thread_id) {
-    producers.emplace_back([thread_id, messages_per_thread, &logger, &log_fn]() {
+    producers.emplace_back([thread_id, messages_per_thread, &logger]() {
       for (int index = 0; index < messages_per_thread; ++index) {
-        log_fn(*logger, thread_id, index);
+        logger.Info(
+            "producer=",
+            thread_id,
+            " seq=",
+            index,
+            " payload=",
+            hlog_bench::LongPayloadBlob());
       }
     });
   }
@@ -86,19 +101,19 @@ BenchmarkResult RunBenchmark(
     producer.join();
   }
 
-  flush_fn(*logger);
+  logger.Flush();
   const auto end = std::chrono::steady_clock::now();
+  const auto stats = logger.Stats();
+  logger.Stop();
+  std::filesystem::remove(path);
 
   const double seconds =
       std::chrono::duration_cast<std::chrono::duration<double>>(end - start).count();
-  const std::uint64_t written = written_fn(*logger);
-  logger->Stop();
-
   return BenchmarkResult{
-      std::move(name),
-      written,
+      logger.name(),
+      stats.written,
       seconds,
-      seconds > 0.0 ? static_cast<double>(written) / seconds : 0.0,
+      seconds > 0.0 ? static_cast<double>(stats.written) / seconds : 0.0,
   };
 }
 
@@ -158,27 +173,16 @@ void PrintSummary(const BenchmarkSummary& summary) {
             << '\n';
 }
 
-template <typename LoggerFactory, typename LogFn, typename FlushFn, typename WrittenFn>
-std::vector<BenchmarkResult> RunBenchmarks(
+std::vector<BenchmarkResult> RunMeasuredRounds(
     int measured_rounds,
     std::string_view name,
+    const hlog::FileSinkOptions& sink_options,
     int thread_count,
-    int messages_per_thread,
-    LoggerFactory&& factory,
-    LogFn&& log_fn,
-    FlushFn&& flush_fn,
-    WrittenFn&& written_fn) {
+    int messages_per_thread) {
   std::vector<BenchmarkResult> results;
   results.reserve(measured_rounds);
   for (int round = 1; round <= measured_rounds; ++round) {
-    auto result = RunBenchmark(
-        std::string(name),
-        thread_count,
-        messages_per_thread,
-        factory,
-        log_fn,
-        flush_fn,
-        written_fn);
+    auto result = RunBenchmark(std::string(name), sink_options, thread_count, messages_per_thread);
     PrintRoundResult("measured", round, result);
     results.push_back(std::move(result));
   }
@@ -189,105 +193,71 @@ std::vector<BenchmarkResult> RunBenchmarks(
 
 int main(int argc, char** argv) {
   const int thread_count = argc > 1 ? std::max(1, std::atoi(argv[1])) : 8;
-  const int messages_per_thread = argc > 2 ? std::max(1, std::atoi(argv[2])) : 50000;
+  const int messages_per_thread = argc > 2 ? std::max(1, std::atoi(argv[2])) : 5000;
   const int measured_rounds = argc > 3 ? std::max(1, std::atoi(argv[3])) : 5;
   const int warmup_rounds = argc > 4 ? std::max(0, std::atoi(argv[4])) : 1;
+
+  hlog::FileSinkOptions unbatched_options;
+  unbatched_options.truncate = true;
+  unbatched_options.max_batch_size = 1;
+  unbatched_options.flush_interval = std::chrono::milliseconds{0};
+
+  hlog::FileSinkOptions batched_options;
+  batched_options.truncate = true;
+  batched_options.max_batch_size = 64 * 1024;
+  batched_options.flush_interval = std::chrono::milliseconds{250};
 
   std::cout << "config threads=" << thread_count
             << " messages_per_thread=" << messages_per_thread
             << " measured_rounds=" << measured_rounds
             << " warmup_rounds=" << warmup_rounds
+            << " payload_bytes=" << hlog_bench::LongPayloadBlob().size()
+            << " unbatched_max_batch_size=" << unbatched_options.max_batch_size
+            << " batched_max_batch_size=" << batched_options.max_batch_size
+            << " batched_flush_interval_ms=" << batched_options.flush_interval.count()
             << '\n';
-
-  const auto mutex_factory = []() {
-    return std::make_unique<hlog_bench::MutexAsyncLogger>(
-        std::make_unique<hlog_bench::CountingSink>());
-  };
-  const auto mutex_log = [](hlog_bench::MutexAsyncLogger& logger, int thread_id, int index) {
-    logger.Log(hlog_bench::MakePayload(thread_id, index));
-  };
-  const auto mutex_flush = [](hlog_bench::MutexAsyncLogger& logger) {
-    logger.Flush();
-  };
-  const auto mutex_written = [](hlog_bench::MutexAsyncLogger& logger) {
-    return logger.written();
-  };
-
-  const auto cas_factory = []() {
-    hlog::AsyncLoggerOptions options;
-    options.queue_size = 1 << 15;
-    options.overflow_policy = hlog::OverflowPolicy::Block;
-    options.level = hlog::LogLevel::Info;
-    options.flush_level = hlog::LogLevel::Off;
-    return std::make_unique<hlog::AsyncLogger>(
-        "cas-benchmark",
-        std::make_unique<hlog_bench::CountingSink>(),
-        options);
-  };
-  const auto cas_log = [](hlog::AsyncLogger& logger, int thread_id, int index) {
-    logger.Info(hlog_bench::MakePayload(thread_id, index));
-  };
-  const auto cas_flush = [](hlog::AsyncLogger& logger) {
-    logger.Flush();
-  };
-  const auto cas_written = [](hlog::AsyncLogger& logger) {
-    return logger.Stats().written;
-  };
 
   for (int round = 1; round <= warmup_rounds; ++round) {
     PrintRoundResult(
         "warmup",
         round,
         RunBenchmark(
-            "mutex_async_logger",
+            "unbatched_file_sink",
+            unbatched_options,
             thread_count,
-            messages_per_thread,
-            mutex_factory,
-            mutex_log,
-            mutex_flush,
-            mutex_written));
+            messages_per_thread));
     PrintRoundResult(
         "warmup",
         round,
         RunBenchmark(
-            "cas_async_logger",
+            "batched_file_sink",
+            batched_options,
             thread_count,
-            messages_per_thread,
-            cas_factory,
-            cas_log,
-            cas_flush,
-            cas_written));
+            messages_per_thread));
   }
 
-  const auto mutex_results = RunBenchmarks(
+  const auto unbatched_results = RunMeasuredRounds(
       measured_rounds,
-      "mutex_async_logger",
+      "unbatched_file_sink",
+      unbatched_options,
       thread_count,
-      messages_per_thread,
-      mutex_factory,
-      mutex_log,
-      mutex_flush,
-      mutex_written);
-
-  const auto cas_results = RunBenchmarks(
+      messages_per_thread);
+  const auto batched_results = RunMeasuredRounds(
       measured_rounds,
-      "cas_async_logger",
+      "batched_file_sink",
+      batched_options,
       thread_count,
-      messages_per_thread,
-      cas_factory,
-      cas_log,
-      cas_flush,
-      cas_written);
+      messages_per_thread);
 
-  const auto mutex_summary = Summarize(mutex_results);
-  const auto cas_summary = Summarize(cas_results);
-  PrintSummary(mutex_summary);
-  PrintSummary(cas_summary);
+  const auto unbatched_summary = Summarize(unbatched_results);
+  const auto batched_summary = Summarize(batched_results);
+  PrintSummary(unbatched_summary);
+  PrintSummary(batched_summary);
 
-  if (mutex_summary.median_throughput > 0.0) {
+  if (unbatched_summary.median_throughput > 0.0) {
     const double improvement =
-        (cas_summary.median_throughput - mutex_summary.median_throughput) /
-        mutex_summary.median_throughput * 100.0;
+        (batched_summary.median_throughput - unbatched_summary.median_throughput) /
+        unbatched_summary.median_throughput * 100.0;
     std::cout << "improvement_percent_median=" << improvement << '\n';
   }
 

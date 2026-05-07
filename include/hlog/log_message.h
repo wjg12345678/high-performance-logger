@@ -1,10 +1,10 @@
 #pragma once
 
+#include "hlog/log_payload.h"
 #include "hlog/log_level.h"
 
 #include <chrono>
 #include <cstdint>
-#include <string>
 #include <string_view>
 
 namespace hlog {
@@ -21,7 +21,7 @@ struct LogMessage {
   std::string_view logger_name;
   std::uint64_t thread_id = 0;
   SourceLocation source{};
-  std::string payload;
+  LogPayload payload;
 };
 
 enum class QueueItemType : std::uint8_t {

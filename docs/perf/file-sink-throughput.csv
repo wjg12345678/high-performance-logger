@@ -1,0 +1,5 @@
+threads,unbatched_median_throughput_msgs_per_sec,batched_median_throughput_msgs_per_sec,improvement_percent
+1,1315.560000,1216.270000,-7.547356
+2,1408.040000,1299.380000,-7.717110
+4,1337.000000,1344.560000,0.565445
+8,1191.600000,1006.500000,-15.533736

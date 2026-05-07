@@ -1,0 +1,12 @@
+services:
+  hlog-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      HLOG_PORT: "8080"
+      HLOG_LEVEL: "info"
+      HLOG_PATTERN: "%Y-%m-%d %H:%M:%S.%e [%l] [%n] [tid=%t] %v"
+      HLOG_LOG_PATH: ""
+    ports:
+      - "18080:8080"

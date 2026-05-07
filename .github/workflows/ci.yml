@@ -1,0 +1,89 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build --build-config Release --output-on-failure
+
+  package-smoke:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install smoke test
+        run: bash scripts/install_smoke_test.sh
+
+  external-benchmark-smoke:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install spdlog
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libspdlog-dev
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build spdlog benchmark
+        run: cmake --build build --target hlog_spdlog_compare_benchmark --parallel
+
+      - name: Run spdlog benchmark smoke
+        run: ./build/hlog_spdlog_compare_benchmark 2 2000 1 0
+
+  sanitizer:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: asan-ubsan
+            configure_flags: -DHLOG_ENABLE_ASAN=ON -DHLOG_ENABLE_UBSAN=ON
+          - name: tsan
+            configure_flags: -DHLOG_ENABLE_TSAN=ON
+
+    env:
+      CC: clang
+      CXX: clang++
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build-${{ matrix.name }} -DCMAKE_BUILD_TYPE=RelWithDebInfo ${{ matrix.configure_flags }}
+
+      - name: Build
+        run: cmake --build build-${{ matrix.name }} --parallel
+
+      - name: Test
+        run: ctest --test-dir build-${{ matrix.name }} --output-on-failure

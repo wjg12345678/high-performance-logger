@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="420" viewBox="0 0 900 420">
+<style>
+text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #16324f; }
+.title { font-size: 20px; font-weight: 700; }
+.axis-label { font-size: 12px; font-weight: 600; }
+.tick { font-size: 11px; fill: #49617b; }
+.grid { stroke: #d7e1ec; stroke-width: 1; }
+.axis { stroke: #35506b; stroke-width: 1.5; }
+.legend { font-size: 12px; font-weight: 600; }
+</style>
+<rect width="100%" height="100%" fill="#f7fbff" rx="12" ry="12"/>
+<text x="80" y="28" class="title">Median File Sink Throughput by Thread Count</text>
+<text x="450.0" y="406" text-anchor="middle" class="axis-label">Threads</text>
+<text x="20" y="206.0" transform="rotate(-90 20 206.0)" class="axis-label">Messages per second</text>
+<line x1="80" y1="364.0" x2="876" y2="364.0" class="grid"/>
+<text x="70" y="368.0" text-anchor="end" class="tick">0</text>
+<line x1="80" y1="300.8" x2="876" y2="300.8" class="grid"/>
+<text x="70" y="304.8" text-anchor="end" class="tick">310</text>
+<line x1="80" y1="237.6" x2="876" y2="237.6" class="grid"/>
+<text x="70" y="241.6" text-anchor="end" class="tick">620</text>
+<line x1="80" y1="174.4" x2="876" y2="174.4" class="grid"/>
+<text x="70" y="178.4" text-anchor="end" class="tick">929</text>
+<line x1="80" y1="111.2" x2="876" y2="111.2" class="grid"/>
+<text x="70" y="115.2" text-anchor="end" class="tick">1.2K</text>
+<line x1="80" y1="48.0" x2="876" y2="48.0" class="grid"/>
+<text x="70" y="52.0" text-anchor="end" class="tick">1.5K</text>
+<line x1="80" y1="48" x2="80" y2="364" class="axis"/>
+<line x1="80" y1="364" x2="876" y2="364" class="axis"/>
+<line x1="80.0" y1="364" x2="80.0" y2="370" class="axis"/>
+<text x="80.0" y="386" text-anchor="middle" class="tick">1</text>
+<line x1="345.3" y1="364" x2="345.3" y2="370" class="axis"/>
+<text x="345.3" y="386" text-anchor="middle" class="tick">2</text>
+<line x1="610.7" y1="364" x2="610.7" y2="370" class="axis"/>
+<text x="610.7" y="386" text-anchor="middle" class="tick">4</text>
+<line x1="876.0" y1="364" x2="876.0" y2="370" class="axis"/>
+<text x="876.0" y="386" text-anchor="middle" class="tick">8</text>
+<line x1="636" y1="24" x2="654" y2="24" stroke="#c84c09" stroke-width="3"/>
+<circle cx="645" cy="24" r="3.5" fill="#c84c09"/>
+<text x="664" y="28" class="legend">unbatched file sink</text>
+<line x1="636" y1="46" x2="654" y2="46" stroke="#007f5f" stroke-width="3"/>
+<circle cx="645" cy="46" r="3.5" fill="#007f5f"/>
+<text x="664" y="50" class="legend">batched file sink</text>
+<polyline fill="none" stroke="#c84c09" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" points="80.0,95.6 345.3,76.7 610.7,91.2 876.0,120.9"/>
+<circle cx="80.0" cy="95.6" r="4" fill="#c84c09"/>
+<text x="80.0" y="85.6" text-anchor="middle" class="tick">1.3K</text>
+<circle cx="345.3" cy="76.7" r="4" fill="#c84c09"/>
+<text x="345.3" y="66.7" text-anchor="middle" class="tick">1.4K</text>
+<circle cx="610.7" cy="91.2" r="4" fill="#c84c09"/>
+<text x="610.7" y="81.2" text-anchor="middle" class="tick">1.3K</text>
+<circle cx="876.0" cy="120.9" r="4" fill="#c84c09"/>
+<text x="876.0" y="110.9" text-anchor="middle" class="tick">1.2K</text>
+<polyline fill="none" stroke="#007f5f" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" points="80.0,115.9 345.3,98.9 610.7,89.7 876.0,158.7"/>
+<circle cx="80.0" cy="115.9" r="4" fill="#007f5f"/>
+<text x="80.0" y="105.9" text-anchor="middle" class="tick">1.2K</text>
+<circle cx="345.3" cy="98.9" r="4" fill="#007f5f"/>
+<text x="345.3" y="88.9" text-anchor="middle" class="tick">1.3K</text>
+<circle cx="610.7" cy="89.7" r="4" fill="#007f5f"/>
+<text x="610.7" y="79.7" text-anchor="middle" class="tick">1.3K</text>
+<circle cx="876.0" cy="158.7" r="4" fill="#007f5f"/>
+<text x="876.0" y="148.7" text-anchor="middle" class="tick">1.0K</text>
+</svg>
