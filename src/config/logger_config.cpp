@@ -1,6 +1,6 @@
 #include "hlog/logger_config.h"
 
-#include "hlog/multi_sink.h"
+#include "hlog/sinks/multi_sink.h"
 
 #include <stdexcept>
 #include <utility>

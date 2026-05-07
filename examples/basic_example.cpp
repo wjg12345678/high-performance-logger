@@ -1,5 +1,6 @@
 #include "hlog/async_logger.h"
-#include "hlog/file_sink.h"
+#include "hlog/sinks/file_sink.h"
+#include "runtime_paths.h"
 
 #include <memory>
 #include <thread>
@@ -14,7 +15,7 @@ int main() {
 
   hlog::AsyncLogger logger(
       "example",
-      std::make_unique<hlog::FileSink>("example.log", true),
+      std::make_unique<hlog::FileSink>(hlog_examples::RuntimeLogPath("example.log"), true),
       options);
 
   std::vector<std::thread> workers;

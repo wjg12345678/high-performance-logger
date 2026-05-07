@@ -7,9 +7,11 @@ HLog 是一个面向高并发场景的 C++20 异步日志库，核心热路径�
 - 采用“日志器 + 输出端 + 后台线程”分层架构，支持日志分级、异步落盘和自定义输出端。
 - 内置 `FileSink / ConsoleSink / RotatingFileSink / MultiSink`，支持文件、控制台、轮转文件以及多目标 fan-out 输出。
 - 提供 `PatternFormatter` 与 `LoggerConfig` 配置层，支持格式模板、sink 组合和运行时组装 logger。
-- 使用基于 `CAS` 的有界无锁环形队列，结合 `atomic::wait/notify` 和 `thread_local` 线程 ID 缓存降低多线程写日志时的热路径开销。
+- 使用基于 `CAS` 的有界无锁环形队列，结合轻量级唤醒路径、原子票据和 `thread_local` 线程 ID 缓存降低多线程写日志时的热路径开销。
 - 将 producer 热路径的 payload 构造改为 `256B` inline buffer + `std::to_chars` 直接追加，减少常见短日志场景下的额外堆分配和流格式化开销。
-- 在 `FileSink` 内部增加 staging buffer 批量写，支持 `max_batch_size / flush_interval`，把后台线程 drain 出来的多条日志拼成连续 buffer 后统一写出。
+- 在 `FileSink` 内部增加 staging buffer 批量写，支持 `max_batch_size / flush_interval`，把后台线程 drain 出来的多条日志拼成连续 buffer 后统一写出，并在空闲期按 deadline 自动刷盘。
+- 后台 sink 抛出异常时不会直接 `terminate` 整个进程，而是进入可观测失败状态，可通过 `failed()` / `failure_message()` 查询。
+- `Stop()` 采用“两阶段关停”语义：先拒绝新的 `Log()/Flush()` 调用，再等待已入场操作完成发布并由后台线程排空队列。
 - 提供阻塞与丢弃两种满队列策略，并通过 install smoke test、sanitizer、内部基线 benchmark 和可选 `spdlog` benchmark 量化与验证效果。
 
 ## 设计目标
@@ -32,6 +34,9 @@ HLog 是一个面向高并发场景的 C++20 异步日志库，核心热路径�
 - 日志分级：支持 `trace / debug / info / warn / error / critical / off`。
 - 背压策略：支持 `Block` 和 `DropNewest` 两种满队列处理方式。
 - 刷盘同步：支持显式 `Flush()`，通过原子票据等待后台线程完成刷盘。
+- 关停语义：`Stop()` 后拒绝新调用，但会继续 drain 已接受日志；`Block` 策略下已进入热路径的 producer 不会被中途打断。
+- 空闲期刷盘：`flush_interval` 到期后，即使没有新日志到来，也会自动 flush 已缓存批次。
+- 故障可观测：后台线程捕获 sink 异常后会拒绝后续写入，并保留失败信息。
 - 内置输出端：提供 `ConsoleSink`、`FileSink`、`RotatingFileSink` 和 `MultiSink`。
 - 格式与配置：提供 `PatternFormatter` 和 `LoggerConfig` factory。
 
@@ -87,14 +92,15 @@ HLog 是一个面向高并发场景的 C++20 异步日志库，核心热路径�
 - 生产者通过 `compare_exchange_weak` 抢占槽位并发布日志消息。
 - 消费线程独占出队和输出端写入，避免多线程同时写文件。
 - `Flush()` 会投递控制消息，并等待原子完成票据更新。
-- 线程唤醒使用 `atomic::wait/notify`，减少额外的互斥锁协调路径。
+- `Stop()` 会先关闭新操作入口，再等待已进入 `Log()/Flush()` 的调用完成发布或失败路径，最后由后台线程排空剩余队列。
+- 后台线程会同时根据工作信号和 sink 的下一次自动刷盘 deadline 协调等待与唤醒。
 
 ## 队列热路径对比
 
 仓库中的 `hlog_compare_benchmark` 在同样的异步模型和同样的内存输出端下，对比两种方案：
 
 - 互斥锁方案：`std::mutex + std::condition_variable + std::deque`
-- 无锁方案：`CAS` 无锁环形队列 + `atomic::wait/notify`
+- 无锁方案：`CAS` 无锁环形队列 + 轻量级后台唤醒路径
 
 示例命令：
 
@@ -226,28 +232,35 @@ HLog 是一个面向高并发场景的 C++20 异步日志库，核心热路径�
 LICENSE
 Dockerfile
 docker-compose.yml
+CMakePresets.json
 include/hlog/
   async_logger.h
-  console_sink.h
-  file_sink.h
+  hlog.h
   logger_config.h
-  lock_free_ring_buffer.h
   log_level.h
-  log_message.h
-  log_payload.h
-  multi_sink.h
   pattern_formatter.h
-  rotating_file_sink.h
   sink.h
+  detail/
+    lock_free_ring_buffer.h
+    log_message.h
+    log_payload.h
+  sinks/
+    console_sink.h
+    file_sink.h
+    multi_sink.h
+    rotating_file_sink.h
 cmake/
   hlogConfig.cmake.in
 src/
-  async_logger.cpp
-  console_sink.cpp
-  file_sink.cpp
-  logger_config.cpp
-  pattern_formatter.cpp
-  rotating_file_sink.cpp
+  config/
+    logger_config.cpp
+  core/
+    async_logger.cpp
+    pattern_formatter.cpp
+  sinks/
+    console_sink.cpp
+    file_sink.cpp
+    rotating_file_sink.cpp
 examples/
   basic_example.cpp
   benchmark_support.h
@@ -263,38 +276,47 @@ tests/
   async_logger_test.cpp
 docs/
   perf.md
+notes/
+  resume-notes.md
 scripts/
   generate_benchmark_report.py
   install_smoke_test.sh
 ```
 
+本地构建、运行日志和安装产物统一收口到 `out/`：
+
+- `out/build/<preset>/`：CMake 构建目录
+- `out/runtime/`：示例与 benchmark 默认日志输出
+- `out/install/package/`：本地 install 前缀
+
 ## 构建与运行
 
 ```bash
-cmake -S . -B build
-cmake --build build -j
-ctest --test-dir build --output-on-failure
+cmake --preset dev
+cmake --build --preset dev
+ctest --preset dev
 ```
 
 示例程序：
 
 ```bash
-./build/hlog_example
-./build/hlog_benchmark
-./build/hlog_compare_benchmark
-./build/hlog_file_sink_benchmark
-./build/hlog_latency_benchmark
-./build/hlog_payload_benchmark
-./build/hlog_service_example
+./out/build/dev/hlog_example
+./out/build/dev/hlog_benchmark
+./out/build/dev/hlog_compare_benchmark
+./out/build/dev/hlog_file_sink_benchmark
+./out/build/dev/hlog_latency_benchmark
+./out/build/dev/hlog_payload_benchmark
+./out/build/dev/hlog_service_example
 ```
 
 如果本机已安装 `spdlog`，还会额外生成：
 
 ```bash
-./build/hlog_spdlog_compare_benchmark
+./out/build/dev/hlog_spdlog_compare_benchmark
 ```
 
-生成的日志默认写入工程目录下的 `example.log`、`benchmark.log` 和 `service.log`。
+生成的日志默认写入 `out/runtime/` 下的 `example.log`、`benchmark.log` 和 `service.log`。
+如果希望改到别的位置，可以设置 `HLOG_ARTIFACT_DIR=/your/path` 或直接对服务示例指定 `HLOG_LOG_PATH`。
 
 服务示例支持通过环境变量调整端口、级别、pattern 和 rotation 参数，例如：
 
@@ -302,7 +324,7 @@ ctest --test-dir build --output-on-failure
 HLOG_PORT=8080 \
 HLOG_LEVEL=info \
 HLOG_PATTERN="%Y-%m-%d %H:%M:%S.%e [%l] [%n] [tid=%t] %v" \
-./build/hlog_service_example
+./out/build/dev/hlog_service_example
 ```
 
 也可以直接在容器里构建并运行服务示例：
@@ -318,9 +340,9 @@ curl -sS http://127.0.0.1:18080/healthz
 如果只想把它当作库来构建，可以关闭 examples 和 tests：
 
 ```bash
-cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DHLOG_BUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF
-cmake --build build-release -j
-cmake --install build-release --prefix /tmp/hlog-install
+cmake --preset package
+cmake --build --preset package
+cmake --install out/build/package
 ```
 
 安装后可以在其他 CMake 项目中通过 `find_package` 使用：
@@ -350,6 +372,9 @@ bash scripts/install_smoke_test.sh
 - `Flush()` 对未消费日志的等待语义
 - `Stop()` 后拒绝新写入，以及 `pending` 统计归零
 - `Stop()` 不显式 `Flush()` 时仍能排空已接受的日志
+- `Stop()` 与 `Block` 背压并发发生时，已进入 `Log()` 但暂时卡在满队列上的 producer 仍会被 drain 完成
+- `FileSink` / `RotatingFileSink` 在空闲期按 `flush_interval` 自动刷盘
+- 后台 sink 异常被捕获并转化为 logger 失败状态
 - `PatternFormatter` token 展开与 `LogLevel` 解析
 - `MultiSink` fan-out 行为
 - `ConsoleSink` 格式化输出
@@ -359,7 +384,7 @@ bash scripts/install_smoke_test.sh
 执行命令：
 
 ```bash
-ctest --test-dir build --output-on-failure
+ctest --preset dev
 ```
 
 ## CI 与 Sanitizer
@@ -374,13 +399,13 @@ ctest --test-dir build --output-on-failure
 本地也可以直接复用同一套开关：
 
 ```bash
-cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=RelWithDebInfo -DHLOG_ENABLE_ASAN=ON -DHLOG_ENABLE_UBSAN=ON
-cmake --build build-asan -j
-ctest --test-dir build-asan --output-on-failure
+cmake --preset asan
+cmake --build --preset asan
+ctest --preset asan
 
-cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=RelWithDebInfo -DHLOG_ENABLE_TSAN=ON
-cmake --build build-tsan -j
-ctest --test-dir build-tsan --output-on-failure
+cmake --preset tsan
+cmake --build --preset tsan
+ctest --preset tsan
 ```
 
 ## 生成正式性能报告
@@ -389,10 +414,10 @@ ctest --test-dir build-tsan --output-on-failure
 
 ```bash
 python3 scripts/generate_benchmark_report.py \
-  --compare-binary ./build/hlog_compare_benchmark \
-  --latency-binary ./build/hlog_latency_benchmark \
-  --payload-binary ./build/hlog_payload_benchmark \
-  --file-sink-binary ./build/hlog_file_sink_benchmark \
+  --compare-binary ./out/build/dev/hlog_compare_benchmark \
+  --latency-binary ./out/build/dev/hlog_latency_benchmark \
+  --payload-binary ./out/build/dev/hlog_payload_benchmark \
+  --file-sink-binary ./out/build/dev/hlog_file_sink_benchmark \
   --output-dir docs/perf \
   --messages-per-thread 20000 \
   --file-messages-per-thread 1000 \

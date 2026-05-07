@@ -1,6 +1,6 @@
 #include "benchmark_support.h"
 #include "hlog/async_logger.h"
-#include "hlog/file_sink.h"
+#include "hlog/sinks/file_sink.h"
 
 #include <algorithm>
 #include <chrono>

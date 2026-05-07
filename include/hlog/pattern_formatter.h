@@ -1,6 +1,6 @@
 #pragma once
 
-#include "hlog/log_message.h"
+#include "hlog/detail/log_message.h"
 
 #include <string>
 #include <string_view>

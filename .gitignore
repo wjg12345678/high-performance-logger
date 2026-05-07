@@ -1,6 +1,8 @@
-build/
-build-*/
+/out/
+/build/
+/build-*/
 *.log
 .DS_Store
 __pycache__/
 *.pyc
+CMakeUserPresets.json

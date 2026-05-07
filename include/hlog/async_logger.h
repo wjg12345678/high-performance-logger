@@ -1,16 +1,19 @@
 #pragma once
 
-#include "hlog/lock_free_ring_buffer.h"
-#include "hlog/log_message.h"
+#include "hlog/detail/lock_free_ring_buffer.h"
+#include "hlog/detail/log_message.h"
 #include "hlog/sink.h"
 
 #include <atomic>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <ostream>
 #include <sstream>
 #include <string>
@@ -117,28 +120,43 @@ public:
   void SetFlushLevel(LogLevel level);
   LogLevel flush_level() const;
 
+  [[nodiscard]] bool failed() const;
+  [[nodiscard]] std::string failure_message() const;
   const std::string& name() const;
   LoggerStats Stats() const;
 
 private:
   class OperationGuard {
   public:
-    explicit OperationGuard(AsyncLogger& logger) : logger_(logger) {
-      logger_.active_operations_.fetch_add(1, std::memory_order_acq_rel);
-    }
+    OperationGuard() = default;
+    explicit OperationGuard(AsyncLogger& logger) noexcept : logger_(&logger) {}
+
+    OperationGuard(const OperationGuard&) = delete;
+    OperationGuard& operator=(const OperationGuard&) = delete;
+
+    OperationGuard(OperationGuard&& other) noexcept
+        : logger_(std::exchange(other.logger_, nullptr)) {}
+
+    OperationGuard& operator=(OperationGuard&&) = delete;
 
     ~OperationGuard() {
-      logger_.FinishOperation();
+      if (logger_ != nullptr) {
+        logger_->FinishOperation();
+      }
+    }
+
+    explicit operator bool() const noexcept {
+      return logger_ != nullptr;
     }
 
   private:
-    AsyncLogger& logger_;
+    AsyncLogger* logger_ = nullptr;
   };
 
   template <typename... Args>
   bool Log(LogLevel level, SourceLocation source, Args&&... args) {
-    OperationGuard guard(*this);
-    if (!running_.load(std::memory_order_acquire) ||
+    OperationGuard guard = TryStartOperation();
+    if (!guard || HasWorkerFailure() ||
         !ShouldLog(level, level_.load(std::memory_order_acquire))) {
       return false;
     }
@@ -166,7 +184,9 @@ private:
   }
 
   bool Publish(QueueItem&& item, bool block_on_full);
+  [[nodiscard]] OperationGuard TryStartOperation();
   bool HandleItem(const QueueItem& item);
+  [[nodiscard]] bool HasWorkerFailure() const;
   static std::uint64_t CurrentThreadId() {
     // Cache the hashed thread id once per producer thread to reduce hot-path work.
     static thread_local const std::uint64_t thread_id =
@@ -174,6 +194,12 @@ private:
     return thread_id;
   }
   void FinishOperation();
+  void NotifyWorker();
+  void RecordWorkerFailure(std::exception_ptr error);
+  [[nodiscard]] bool RequestStop();
+  [[nodiscard]] bool StopRequested() const;
+  [[nodiscard]] std::uint64_t ActiveOperationCount() const;
+  void WaitForWakeup(std::uint64_t signal);
   void WorkerLoop();
 
   template <typename T>
@@ -223,19 +249,26 @@ private:
   OverflowPolicy overflow_policy_;
   std::thread worker_;
 
-  std::atomic<bool> running_{true};
-  std::atomic<bool> stopping_{false};
+  static constexpr std::uint64_t kOperationGateClosedBit = std::uint64_t{1} << 63;
+  static constexpr std::uint64_t kActiveOperationMask = ~kOperationGateClosedBit;
+
+  std::atomic<std::uint64_t> operation_state_{0};
   std::atomic<LogLevel> level_{LogLevel::Info};
   std::atomic<LogLevel> flush_level_{LogLevel::Error};
 
-  std::atomic<std::uint64_t> active_operations_{0};
   std::atomic<std::uint64_t> wake_signal_{0};
   std::atomic<std::uint64_t> flush_request_ticket_{0};
   std::atomic<std::uint64_t> flush_complete_ticket_{0};
+  std::atomic<bool> worker_failed_{false};
 
   std::atomic<std::uint64_t> enqueued_{0};
   std::atomic<std::uint64_t> dropped_{0};
   std::atomic<std::uint64_t> written_{0};
+  mutable std::mutex wake_mutex_;
+  std::condition_variable wake_condition_;
+  mutable std::mutex failure_mutex_;
+  std::exception_ptr background_failure_;
+  std::string background_failure_message_;
 };
 
 }  // namespace hlog

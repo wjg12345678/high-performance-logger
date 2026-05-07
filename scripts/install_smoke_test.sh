@@ -42,4 +42,7 @@ cmake -S "$repo_root/examples/find_package_consumer" -B "$consumer_build_dir" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_PREFIX_PATH="$prefix_dir"
 cmake --build "$consumer_build_dir" --parallel
-"$consumer_build_dir/hlog_find_package_consumer"
+(
+  cd "$consumer_build_dir"
+  ./hlog_find_package_consumer
+)

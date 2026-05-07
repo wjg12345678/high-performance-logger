@@ -1,10 +1,10 @@
 #pragma once
 
 #include "hlog/async_logger.h"
-#include "hlog/console_sink.h"
-#include "hlog/file_sink.h"
-#include "hlog/rotating_file_sink.h"
 #include "hlog/sink.h"
+#include "hlog/sinks/console_sink.h"
+#include "hlog/sinks/file_sink.h"
+#include "hlog/sinks/rotating_file_sink.h"
 
 #include <memory>
 #include <string>

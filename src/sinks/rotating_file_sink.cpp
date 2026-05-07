@@ -1,4 +1,4 @@
-#include "hlog/rotating_file_sink.h"
+#include "hlog/sinks/rotating_file_sink.h"
 
 #include <algorithm>
 #include <chrono>
@@ -165,6 +165,26 @@ void RotatingFileSink::Write(const LogMessage& message) {
 
 void RotatingFileSink::Flush() {
   DrainStagingBuffer(true);
+}
+
+Sink::Clock::time_point RotatingFileSink::NextAutoFlushTime() const {
+  if (staging_buffer_.empty() ||
+      options_.flush_interval.count() <= 0 ||
+      batch_started_at_ == Clock::time_point{}) {
+    return Sink::Clock::time_point::max();
+  }
+
+  return batch_started_at_ + options_.flush_interval;
+}
+
+bool RotatingFileSink::FlushIfDue(Sink::Clock::time_point now) {
+  const auto deadline = NextAutoFlushTime();
+  if (deadline == Sink::Clock::time_point::max() || now < deadline) {
+    return false;
+  }
+
+  DrainStagingBuffer(true);
+  return true;
 }
 
 }  // namespace hlog

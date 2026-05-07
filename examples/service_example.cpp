@@ -1,5 +1,6 @@
 #include "hlog/logger_config.h"
 #include "hlog/log_level.h"
+#include "runtime_paths.h"
 
 #include <algorithm>
 #include <atomic>
@@ -288,7 +289,8 @@ ServiceConfig LoadConfig() {
   console.options.pattern = pattern;
   config.logger.sinks.emplace_back(console);
 
-  const std::string log_path = GetEnvOrDefault("HLOG_LOG_PATH", "service.log");
+  const std::string log_path =
+      GetEnvOrDefault("HLOG_LOG_PATH", hlog_examples::RuntimeLogPath("service.log"));
   if (!log_path.empty()) {
     hlog::RotatingFileSinkConfig file;
     file.path = log_path;

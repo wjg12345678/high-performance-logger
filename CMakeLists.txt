@@ -55,12 +55,12 @@ elseif (HLOG_ENABLE_ASAN OR HLOG_ENABLE_TSAN OR HLOG_ENABLE_UBSAN)
 endif()
 
 add_library(hlog
-  src/async_logger.cpp
-  src/console_sink.cpp
-  src/file_sink.cpp
-  src/logger_config.cpp
-  src/pattern_formatter.cpp
-  src/rotating_file_sink.cpp
+  src/config/logger_config.cpp
+  src/core/async_logger.cpp
+  src/core/pattern_formatter.cpp
+  src/sinks/console_sink.cpp
+  src/sinks/file_sink.cpp
+  src/sinks/rotating_file_sink.cpp
 )
 
 add_library(HLog::hlog ALIAS hlog)

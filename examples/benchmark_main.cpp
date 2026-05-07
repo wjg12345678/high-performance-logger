@@ -1,5 +1,6 @@
 #include "hlog/async_logger.h"
-#include "hlog/file_sink.h"
+#include "hlog/sinks/file_sink.h"
+#include "runtime_paths.h"
 
 #include <algorithm>
 #include <chrono>
@@ -21,7 +22,7 @@ int main(int argc, char** argv) {
 
   hlog::AsyncLogger logger(
       "benchmark",
-      std::make_unique<hlog::FileSink>("benchmark.log", true),
+      std::make_unique<hlog::FileSink>(hlog_examples::RuntimeLogPath("benchmark.log"), true),
       options);
 
   const auto start = std::chrono::steady_clock::now();

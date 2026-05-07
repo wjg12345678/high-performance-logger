@@ -1,12 +1,13 @@
 #include "hlog/async_logger.h"
-#include "hlog/console_sink.h"
-#include "hlog/file_sink.h"
 #include "hlog/logger_config.h"
-#include "hlog/multi_sink.h"
 #include "hlog/pattern_formatter.h"
-#include "hlog/rotating_file_sink.h"
+#include "hlog/sinks/console_sink.h"
+#include "hlog/sinks/file_sink.h"
+#include "hlog/sinks/multi_sink.h"
+#include "hlog/sinks/rotating_file_sink.h"
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <exception>
@@ -89,6 +90,61 @@ private:
   std::atomic<std::uint64_t> flushed_{0};
 };
 
+class GatedSink final : public hlog::Sink {
+public:
+  void Write(const hlog::LogMessage&) override {
+    write_started_.store(true, std::memory_order_release);
+    while (!allow_writes_.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    written_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  void Flush() override {}
+
+  void AllowWrites() {
+    allow_writes_.store(true, std::memory_order_release);
+  }
+
+  bool write_started() const {
+    return write_started_.load(std::memory_order_acquire);
+  }
+
+  std::uint64_t written() const {
+    return written_.load(std::memory_order_relaxed);
+  }
+
+private:
+  std::atomic<bool> allow_writes_{false};
+  std::atomic<bool> write_started_{false};
+  std::atomic<std::uint64_t> written_{0};
+};
+
+class ThrowingSink final : public hlog::Sink {
+public:
+  enum class FailurePoint {
+    Write = 0,
+    Flush = 1,
+  };
+
+  explicit ThrowingSink(FailurePoint failure_point) : failure_point_(failure_point) {}
+
+  void Write(const hlog::LogMessage&) override {
+    if (failure_point_ == FailurePoint::Write) {
+      throw std::runtime_error("sink write failed");
+    }
+  }
+
+  void Flush() override {
+    if (failure_point_ == FailurePoint::Flush) {
+      throw std::runtime_error("sink flush failed");
+    }
+  }
+
+private:
+  FailurePoint failure_point_;
+};
+
 class InspectingSink final : public hlog::Sink {
 public:
   void Write(const hlog::LogMessage& message) override {
@@ -119,6 +175,41 @@ std::vector<std::string> ReadLines(const std::filesystem::path& path) {
   }
   return lines;
 }
+
+template <typename Predicate>
+bool WaitUntil(
+    Predicate&& predicate,
+    std::chrono::milliseconds timeout = std::chrono::seconds(2),
+    std::chrono::milliseconds poll_interval = std::chrono::milliseconds(10)) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (predicate()) {
+      return true;
+    }
+    std::this_thread::sleep_for(poll_interval);
+  }
+  return predicate();
+}
+
+struct WriteReleaseGuard {
+  GatedSink* sink = nullptr;
+
+  ~WriteReleaseGuard() {
+    if (sink != nullptr) {
+      sink->AllowWrites();
+    }
+  }
+};
+
+struct ThreadJoinGuard {
+  std::thread* thread = nullptr;
+
+  ~ThreadJoinGuard() {
+    if (thread != nullptr && thread->joinable()) {
+      thread->join();
+    }
+  }
+};
 
 void TestLevelFiltering() {
   const auto path = std::filesystem::temp_directory_path() / "hlog_level_filter.log";
@@ -333,6 +424,70 @@ void TestStopDrainsQueuedWrites() {
   ExpectEqual(sink_ptr->written(), kExpected, "stop drain sink written");
 }
 
+void TestStopDrainsInFlightBlockedProducers() {
+  constexpr std::size_t kProducerCount = 4;
+
+  auto sink = std::make_unique<GatedSink>();
+  auto* sink_ptr = sink.get();
+
+  hlog::AsyncLoggerOptions options;
+  options.queue_size = 2;
+  options.overflow_policy = hlog::OverflowPolicy::Block;
+  options.level = hlog::LogLevel::Info;
+  options.flush_level = hlog::LogLevel::Off;
+
+  hlog::AsyncLogger logger("stop-race-test", std::move(sink), options);
+  std::thread stopper;
+  ThreadJoinGuard stopper_join{&stopper};
+  WriteReleaseGuard release_guard{sink_ptr};
+
+  std::atomic<bool> start{false};
+  std::array<bool, kProducerCount> results{};
+  std::vector<std::thread> producers;
+  producers.reserve(kProducerCount);
+  for (std::size_t index = 0; index < kProducerCount; ++index) {
+    producers.emplace_back([&, index]() {
+      while (!start.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      results[index] = logger.Info("stop race msg=", index);
+    });
+  }
+
+  start.store(true, std::memory_order_release);
+
+  Expect(
+      WaitUntil([&logger]() {
+        return logger.Stats().enqueued == kProducerCount;
+      }),
+      "all blocking producers should enter the logging path before stop");
+
+  stopper = std::thread([&logger]() {
+    logger.Stop();
+  });
+
+  Expect(
+      WaitUntil([sink_ptr]() {
+        return sink_ptr->write_started();
+      }),
+      "worker should begin draining before writes are released");
+
+  sink_ptr->AllowWrites();
+
+  for (auto& producer : producers) {
+    producer.join();
+  }
+
+  const auto stats = logger.Stats();
+  for (std::size_t index = 0; index < kProducerCount; ++index) {
+    Expect(results[index], "stop should drain already-started blocking producers");
+  }
+  ExpectEqual(stats.enqueued, static_cast<std::uint64_t>(kProducerCount), "stop race enqueued");
+  ExpectEqual(stats.written, static_cast<std::uint64_t>(kProducerCount), "stop race written");
+  ExpectEqual(stats.pending, std::uint64_t{0}, "stop race pending");
+  ExpectEqual(sink_ptr->written(), static_cast<std::uint64_t>(kProducerCount), "stop race sink written");
+}
+
 void TestBatchedFileSinkFlushesTailOnStop() {
   const auto path = std::filesystem::temp_directory_path() / "hlog_batched_tail_flush.log";
   std::filesystem::remove(path);
@@ -369,6 +524,105 @@ void TestBatchedFileSinkFlushesTailOnStop() {
   ExpectEqual(stats.enqueued, std::uint64_t{12}, "batched stop enqueued");
   ExpectEqual(stats.written, std::uint64_t{12}, "batched stop written");
   ExpectEqual(stats.pending, std::uint64_t{0}, "batched stop pending");
+}
+
+void TestFileSinkFlushesOnIdleDeadline() {
+  const auto path = std::filesystem::temp_directory_path() / "hlog_idle_flush.log";
+  std::filesystem::remove(path);
+
+  hlog::AsyncLoggerOptions options;
+  options.queue_size = 64;
+  options.level = hlog::LogLevel::Info;
+  options.flush_level = hlog::LogLevel::Off;
+
+  hlog::FileSinkOptions sink_options;
+  sink_options.truncate = true;
+  sink_options.max_batch_size = 1 << 20;
+  sink_options.flush_interval = std::chrono::milliseconds(25);
+
+  hlog::AsyncLogger logger(
+      "idle-flush-test",
+      std::make_unique<hlog::FileSink>(path.string(), sink_options),
+      options);
+
+  Expect(logger.Info("idle flush payload"), "idle flush log should succeed");
+  Expect(
+      WaitUntil([&path]() {
+        const auto lines = ReadLines(path);
+        return !lines.empty();
+      },
+      std::chrono::seconds(5),
+      std::chrono::milliseconds(20)),
+      "file sink should flush buffered lines after idle deadline");
+
+  const auto lines = ReadLines(path);
+  ExpectEqual(lines.size(), std::size_t{1}, "idle flush line count");
+  Expect(lines.front().find("idle flush payload") != std::string::npos, "idle flush payload");
+
+  logger.Stop();
+}
+
+void TestRotatingFileSinkFlushesOnIdleDeadline() {
+  const auto path = std::filesystem::temp_directory_path() / "hlog_rotating_idle_flush.log";
+  std::filesystem::remove(path);
+  std::filesystem::remove(path.string() + ".1");
+
+  hlog::AsyncLoggerOptions options;
+  options.queue_size = 64;
+  options.level = hlog::LogLevel::Info;
+  options.flush_level = hlog::LogLevel::Off;
+
+  hlog::RotatingFileSinkOptions sink_options;
+  sink_options.truncate_on_open = true;
+  sink_options.max_file_size = 1 << 20;
+  sink_options.max_files = 1;
+  sink_options.max_batch_size = 1 << 20;
+  sink_options.flush_interval = std::chrono::milliseconds(25);
+
+  hlog::AsyncLogger logger(
+      "rotating-idle-flush-test",
+      std::make_unique<hlog::RotatingFileSink>(path.string(), sink_options),
+      options);
+
+  Expect(logger.Info("rotating idle flush payload"), "rotating idle flush log should succeed");
+  Expect(
+      WaitUntil([&path]() {
+        const auto lines = ReadLines(path);
+        return !lines.empty();
+      },
+      std::chrono::seconds(5),
+      std::chrono::milliseconds(20)),
+      "rotating file sink should flush buffered lines after idle deadline");
+
+  const auto lines = ReadLines(path);
+  ExpectEqual(lines.size(), std::size_t{1}, "rotating idle flush line count");
+  Expect(
+      lines.front().find("rotating idle flush payload") != std::string::npos,
+      "rotating idle flush payload");
+
+  logger.Stop();
+}
+
+void TestWorkerFailureIsCaptured() {
+  hlog::AsyncLoggerOptions options;
+  options.queue_size = 32;
+  options.level = hlog::LogLevel::Info;
+  options.flush_level = hlog::LogLevel::Off;
+
+  hlog::AsyncLogger logger(
+      "worker-failure-test",
+      std::make_unique<ThrowingSink>(ThrowingSink::FailurePoint::Write),
+      options);
+
+  Expect(logger.Info("trigger worker failure"), "worker failure log should be accepted");
+  logger.Stop();
+
+  Expect(logger.failed(), "worker failure should be captured");
+  Expect(!logger.Info("after worker failure"), "logger should reject writes after worker failure");
+  Expect(!logger.Flush(), "flush should fail after worker failure");
+  Expect(
+      logger.failure_message().find("sink write failed") != std::string::npos,
+      "worker failure message should be preserved");
 }
 
 void TestShortPayloadUsesInlineStorage() {
@@ -580,7 +834,11 @@ int main() {
     TestFlushWaitsForOutstandingWrites();
     TestStopRejectsNewWrites();
     TestStopDrainsQueuedWrites();
+    TestStopDrainsInFlightBlockedProducers();
     TestBatchedFileSinkFlushesTailOnStop();
+    TestFileSinkFlushesOnIdleDeadline();
+    TestRotatingFileSinkFlushesOnIdleDeadline();
+    TestWorkerFailureIsCaptured();
     TestShortPayloadUsesInlineStorage();
     TestLargePayloadSpillsToHeap();
     TestPatternFormatterExpandsTokens();

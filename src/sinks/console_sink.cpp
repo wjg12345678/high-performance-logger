@@ -1,4 +1,4 @@
-#include "hlog/console_sink.h"
+#include "hlog/sinks/console_sink.h"
 
 #include <iostream>
 #include <ostream>

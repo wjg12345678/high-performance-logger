@@ -10,29 +10,37 @@
 
 namespace hlog {
 
-struct FileSinkOptions {
-  bool truncate = false;
+struct RotatingFileSinkOptions {
+  bool truncate_on_open = false;
+  std::size_t max_file_size = 10 * 1024 * 1024;
+  std::size_t max_files = 3;
   std::size_t max_batch_size = 64 * 1024;
   std::chrono::milliseconds flush_interval{50};
   std::string pattern = std::string(kDefaultLogPattern);
 };
 
-class FileSink final : public Sink {
+class RotatingFileSink final : public Sink {
 public:
-  explicit FileSink(const std::string& path, bool truncate = false);
-  FileSink(const std::string& path, FileSinkOptions options);
+  explicit RotatingFileSink(std::string path, RotatingFileSinkOptions options = {});
 
   void Write(const LogMessage& message) override;
   void Flush() override;
+  Sink::Clock::time_point NextAutoFlushTime() const override;
+  bool FlushIfDue(Sink::Clock::time_point now) override;
 
 private:
-  using Clock = std::chrono::steady_clock;
+  using Clock = Sink::Clock;
 
+  void Open(std::ios::openmode mode);
+  void ResetOnStartup();
+  void RotateFiles();
   void DrainStagingBuffer(bool flush_stream);
 
-  FileSinkOptions options_{};
+  std::string path_;
+  RotatingFileSinkOptions options_{};
   std::ofstream output_;
   std::string staging_buffer_;
+  std::size_t current_size_ = 0;
   Clock::time_point batch_started_at_{};
   PatternFormatter formatter_;
 };

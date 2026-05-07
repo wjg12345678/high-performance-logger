@@ -1,8 +1,9 @@
 .git
 .github
 .DS_Store
-build
-build-*
+/out
+/build
+/build-*
 *.log
 docs/perf
-scripts/__pycache__
+__pycache__

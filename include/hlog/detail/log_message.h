@@ -1,6 +1,6 @@
 #pragma once
 
-#include "hlog/log_payload.h"
+#include "hlog/detail/log_payload.h"
 #include "hlog/log_level.h"
 
 #include <chrono>

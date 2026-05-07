@@ -47,6 +47,22 @@ public:
     }
   }
 
+  Sink::Clock::time_point NextAutoFlushTime() const override {
+    auto next_flush = Sink::Clock::time_point::max();
+    for (const auto& sink : sinks_) {
+      next_flush = std::min(next_flush, sink->NextAutoFlushTime());
+    }
+    return next_flush;
+  }
+
+  bool FlushIfDue(Sink::Clock::time_point now) override {
+    bool flushed = false;
+    for (auto& sink : sinks_) {
+      flushed = sink->FlushIfDue(now) || flushed;
+    }
+    return flushed;
+  }
+
 private:
   std::vector<std::unique_ptr<Sink>> sinks_;
 };
