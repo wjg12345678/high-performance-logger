@@ -9,7 +9,7 @@ HLog 是一个面向高并发场景的 C++20 异步日志库。它的核心是�
 - 业务线程只做日志级别判断、payload 构造和入队。
 - 后台线程独占消费队列并写入 sink。
 - producer 与 consumer 之间用基于 CAS 的有界无锁环形队列连接。
-- 通过 `atomic::wait/notify` 做轻量唤醒。
+- worker 唤醒使用 `condition_variable + wake_signal`，flush ticket 等待使用 C++20 原子等待。
 - 通过 inline payload、`std::to_chars`、thread local 线程 ID、FileSink staging buffer 优化热路径。
 
 可以这样介绍：
@@ -53,7 +53,7 @@ HLog 是一个面向高并发场景的 C++20 异步日志库。它的核心是�
 ```text
 include/hlog/
   async_logger.h              异步日志器 API、配置、统计、热路径模板
-  lock_free_ring_buffer.h     基于槽位序号的有界无锁队列
+  detail/lock_free_ring_buffer.h 基于槽位序号的有界无锁队列
   log_payload.h               256B inline payload，小日志避免堆分配
   log_message.h               日志消息结构和 source location
   log_level.h                 日志等级
@@ -161,7 +161,7 @@ AsyncLogger::Publish
   v
 LockFreeRingBuffer<QueueItem>
   |
-  | atomic wait/notify
+  | wake_signal + condition_variable
   v
 worker thread
   |
@@ -258,13 +258,13 @@ struct LoggerStats {
 
 ## 9. OperationGuard 的作用
 
-`OperationGuard` 构造时 `active_operations_++`，析构时 `FinishOperation()`。
+`OperationGuard` 由 `TryStartOperation()` 返回。进入日志或 flush 路径前，`TryStartOperation()` 会在 `operation_state_` 中增加活跃操作计数；析构时调用 `FinishOperation()` 减少计数。
 
 它主要解决停止过程中的竞态：
 
-- 当 `Stop()` 开始时，新的日志会看到 `running_ = false`。
+- 当 `Stop()` 开始时，`operation_state_` 的 gate bit 会被关闭，新调用无法再获得 `OperationGuard`。
 - 但已经进入 `Log()` 的 producer 可能还没完成入队。
-- worker 退出前必须等活跃 producer 数量变成 0。
+- worker 退出前必须等 gate 已关闭且活跃 producer 数量变成 0。
 - `FinishOperation()` 在最后一个活跃操作结束时唤醒 worker。
 
 没有这个机制，Stop 可能在线程还在 Publish 时提前退出，导致日志丢失或对象生命周期风险。
@@ -302,7 +302,7 @@ struct LoggerStats {
 
 ## 12. 无锁环形队列原理
 
-看 `include/hlog/lock_free_ring_buffer.h`。
+看 `include/hlog/detail/lock_free_ring_buffer.h`。
 
 它是一个有界 MPMC 队列风格实现，核心是每个槽位都有独立 `sequence`。
 
@@ -379,26 +379,29 @@ sequence 把槽位状态和全局 position 绑定起来。每绕一圈，sequenc
 
 原因是多个 producer 高频写 `enqueue_pos_`，consumer 高频写 `dequeue_pos_`。如果两个原子落在同一个 cache line，会导致不必要的缓存一致性流量。对齐到 64 字节可以降低 false sharing。
 
-## 16. atomic::wait/notify
+## 16. worker 唤醒和 flush 等待
 
-`wake_signal_` 是 worker 等待/唤醒的信号。
+最新实现中，worker 休眠使用 `condition_variable`，同时保留 `wake_signal_` 作为无锁可读的版本号。flush 完成票据仍使用 C++20 原子等待。
 
-producer 入队成功：
+producer 入队成功会调用 `NotifyWorker()`：
 
 ```cpp
 wake_signal_.fetch_add(1);
-wake_signal_.notify_one();
+wake_condition_.notify_one();
 ```
 
-worker drain 完队列后：
+worker drain 完队列后读取当前 signal，再进入 `WaitForWakeup(signal)`：
 
 ```cpp
 auto signal = wake_signal_.load();
 if (queue_.TryDequeue(item)) continue;
-wake_signal_.wait(signal);
+WaitForWakeup(signal);
 ```
 
-这里有一个重要细节：worker 在 wait 前会再次 TryDequeue，避免“检查空队列”和“进入等待”之间有新日志到达导致漏唤醒。
+这里有两个重要细节：
+
+- worker 在 wait 前会再次 TryDequeue，避免“检查空队列”和“进入等待”之间有新日志到达导致漏唤醒。
+- `WaitForWakeup()` 会查看 sink 的 `NextAutoFlushTime()`，如果 FileSink 的 flush deadline 到期，即使没有新日志也会醒来执行 `FlushIfDue()`。
 
 ## 17. WorkerLoop
 
@@ -434,15 +437,15 @@ wake_signal_.wait(signal);
 
 `Stop()`：
 
-- 用 CAS 设置 `stopping_`，保证只执行一次停止流程。
-- 设置 `running_ = false`，阻止新日志继续进入。
+- 用 CAS 设置 `operation_state_` 的高位 gate bit，保证只执行一次停止流程。
+- gate bit 关闭后，新的 `Log()/Flush()` 无法获得 `OperationGuard`。
 - 唤醒 worker。
 - join worker。
 
 worker 只有在：
 
-- `stopping_ == true`
-- `active_operations_ == 0`
+- `StopRequested() == true`
+- `ActiveOperationCount() == 0`
 - 队列已经 drain
 
 时才退出。
@@ -583,7 +586,7 @@ formatter 负责把 `LogMessage` 变成字符串。常见字段包括：
 对比：
 
 - `mutex + condition_variable + deque`
-- `CAS lock-free ring buffer + atomic wait/notify`
+- `CAS lock-free ring buffer + wake_signal/condition_variable`
 
 目标是隔离队列和线程同步开销。通常使用内存 sink，避免磁盘 I/O 干扰。
 
@@ -631,7 +634,7 @@ formatter 负责把 `LogMessage` 变成字符串。常见字段包括：
 
 ### 第二遍：队列
 
-1. `include/hlog/lock_free_ring_buffer.h`
+1. `include/hlog/detail/lock_free_ring_buffer.h`
 2. 画出 enqueue/dequeue 的 sequence 变化。
 3. 理解 capacity、mask、position、sequence 的关系。
 4. 理解 acquire/release 的位置。
@@ -672,7 +675,7 @@ formatter 负责把 `LogMessage` 变成字符串。常见字段包括：
 
 ### 30 秒版本
 
-> HLog 是我写的 C++20 异步日志库。业务线程只做级别过滤、payload 构造和入队，后台线程顺序消费并写 sink。核心队列是基于槽位 sequence 的有界无锁环形队列，配合 `atomic::wait/notify` 降低唤醒开销。项目还优化了 producer payload，用 256B inline buffer 和 `std::to_chars` 减少短日志分配和 iostream 开销，并提供 FileSink batching、轮转、多 sink、benchmark 和安装导出。
+> HLog 是我写的 C++20 异步日志库。业务线程只做级别过滤、payload 构造和入队，后台线程顺序消费并写 sink。核心队列是基于槽位 sequence 的有界无锁环形队列，worker 唤醒采用 `wake_signal + condition_variable`，flush ticket 使用原子等待。项目还优化了 producer payload，用 256B inline buffer 和 `std::to_chars` 减少短日志分配和 iostream 开销，并提供 FileSink batching、空闲期自动 flush、后台异常可观测、轮转、多 sink、benchmark 和安装导出。
 
 ### 2 分钟版本
 
@@ -685,7 +688,7 @@ formatter 负责把 `LogMessage` 变成字符串。常见字段包括：
 ### 版本一
 
 - 基于 C++20 实现高性能异步日志库，采用多生产者单消费者架构，业务线程将日志写入 CAS 有界无锁环形队列，后台线程批量消费并输出到 File/Console/Rotating/Multi Sink。
-- 设计基于槽位 sequence 的 MPMC ring buffer，使用 acquire/release 内存序发布数据，配合 `atomic::wait/notify`、cache line 对齐和满队列 backoff 策略降低高并发写日志锁竞争。
+- 设计基于槽位 sequence 的 MPMC ring buffer，使用 acquire/release 内存序发布数据，配合 `wake_signal + condition_variable`、cache line 对齐和满队列 backoff 策略降低高并发写日志锁竞争。
 - 优化 producer 热路径：实现 256B inline `LogPayload`、整数 `std::to_chars` 追加、`thread_local` 线程 ID 缓存和 FileSink staging buffer，并通过吞吐、延迟、payload、file sink benchmark 验证效果。
 
 ### 版本二
