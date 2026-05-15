@@ -2,6 +2,13 @@
 
 HLog 是一个面向高并发场景的 C++20 异步日志库，核心热路径使用基于 `CAS` 的无锁环形队列替代 `mutex` 队列，重点优化多线程日志写入下的锁竞争、payload 构造和单消费者输出路径。
 
+## 文档索引
+
+- [docs/perf.md](docs/perf.md)：吞吐、调用延迟、payload 热路径和文件 sink benchmark 报告。
+- [docs/简历材料.md](docs/简历材料.md)：项目简历写法、亮点提炼和面试讲法。
+- [docs/project-study-guide-complete.md](docs/project-study-guide-complete.md)：完整学习路线、代码阅读顺序、架构拆解和生产化边界。
+- [docs/interview-qna-complete.md](docs/interview-qna-complete.md)：高频面试问题与完整回答。
+
 ## 产品特性
 
 - 采用“日志器 + 输出端 + 后台线程”分层架构，支持日志分级、异步落盘和自定义输出端。

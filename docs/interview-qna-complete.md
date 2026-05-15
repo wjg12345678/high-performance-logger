@@ -1,0 +1,410 @@
+# HLog 面试问题与完整回答
+
+这份文档按面试常见追问组织。回答时重点放在设计动机、并发正确性、性能权衡和工程边界，不要只说“用了无锁队列”。
+
+## 一、项目整体
+
+### 1. 这个项目是什么？
+
+HLog 是一个 C++20 高性能异步日志库。它采用 Logger + Sink + 后台线程架构，业务线程把日志封装成消息并写入有界无锁环形队列，后台线程从队列中消费日志并写入文件、控制台、轮转文件或多个 sink。项目重点优化多线程写日志时的锁竞争、producer payload 构造、线程唤醒和文件批量写路径。
+
+### 2. 为什么要做异步日志库？
+
+同步日志会让业务线程直接参与格式化、加锁和文件 I/O。在高并发场景下，多个线程竞争同一把锁，日志写入可能成为热点。异步日志把业务线程和 I/O 线程解耦，业务线程只负责构造消息和入队，后台线程顺序写出，从而降低业务线程延迟。
+
+### 3. 项目的核心亮点是什么？
+
+核心亮点有四个：
+
+1. 基于 CAS 的有界无锁环形队列，减少多 producer 写日志时的 mutex 竞争。
+2. `atomic::wait/notify` 唤醒后台线程，避免传统 condition_variable 路径。
+3. 256B inline payload + `std::to_chars`，优化短日志和整数参数热路径。
+4. 完整工程闭环：sink 抽象、文件轮转、多 sink、flush/stop 生命周期、benchmark、测试和 CMake install/export。
+
+### 4. 整体架构怎么讲？
+
+架构是多生产者单消费者。多个业务线程调用 logger，完成级别过滤、payload 构造和入队；后台线程独占消费队列，调用 sink 写出日志。队列连接 producer 和 consumer，sink 抽象负责把日志输出到不同目标。
+
+### 5. 为什么选择多生产者单消费者？
+
+日志输出通常需要保持一定顺序，文件写入也天然适合串行化。多生产者单消费者可以让业务线程并发入队，同时让后台线程独占 sink，避免多个线程同时写文件。这样并发问题集中在队列上，输出路径更简单。
+
+### 6. 这个项目是生产级日志库吗？
+
+它具备可复用库的基本能力，包括异步写入、sink 抽象、轮转、flush、benchmark、安装导出等。但如果作为完整生产日志平台，还需要更多能力，比如动态配置、结构化 JSON、日志压缩和保留策略、错误回调、监控指标、崩溃恢复策略、多进程采集和更长期的线上验证。
+
+### 7. 和 spdlog 有什么区别？
+
+spdlog 是成熟的工业级日志库，功能生态更完整。HLog 是我为了展示并发队列和异步日志热路径优化实现的项目，重点在 lock-free ring buffer、payload 优化和可验证 benchmark。可以做特定场景下的性能对比，但不能简单说完全替代 spdlog。
+
+### 8. 如果让你一句话介绍？
+
+我会说：HLog 是一个 C++20 异步日志库，使用基于槽位 sequence 的 CAS 有界无锁队列连接业务线程和后台写线程，并通过 inline payload、`to_chars`、`atomic::wait/notify` 和文件批量写优化高并发写日志路径。
+
+## 二、异步日志设计
+
+### 9. 同步日志有什么问题？
+
+同步日志的问题是业务线程要承担完整日志成本，包括格式化、加锁、写文件、flush 等。在多线程场景下，所有线程可能竞争同一个 sink 锁；如果磁盘或终端输出变慢，业务请求也会跟着变慢。
+
+### 10. 异步日志解决了什么？
+
+异步日志把日志生产和日志输出解耦。业务线程只把日志放入队列，后台线程统一写出。这样业务线程不直接等待文件 I/O，大部分情况下延迟更低。
+
+### 11. 异步日志带来什么新问题？
+
+主要有：
+
+- 队列满了怎么办。
+- 进程退出前如何保证日志刷完。
+- 后台线程异常怎么处理。
+- 日志可能丢失的语义怎么暴露。
+- 队列和对象生命周期如何保证线程安全。
+
+所以异步日志不是简单加一个线程，还要处理背压、flush、stop 和统计。
+
+### 12. 为什么队列要有界？
+
+无界队列在日志洪峰时可能无限占用内存，最终影响业务进程。日志系统不能为了记录日志把服务拖垮。有界队列让内存上限可控，并强制用户选择阻塞或丢弃策略。
+
+### 13. 队列满时怎么处理？
+
+HLog 支持两种策略：
+
+- `Block`：业务线程等待直到入队成功，尽量不丢日志。
+- `DropNewest`：队列满时丢弃当前新日志，保护业务线程延迟。
+
+选择取决于业务。审计日志更适合 Block，高频调试日志更适合 DropNewest。
+
+### 14. 为什么不是 DropOldest？
+
+DropOldest 需要 consumer 或 producer 安全地覆盖最老日志，会让队列语义和并发控制更复杂。当前项目先实现 DropNewest，因为它只需要在入队失败时返回，不破坏队列内部顺序。后续可以扩展 DropOldest，但要谨慎处理并发覆盖和统计语义。
+
+### 15. 异步日志会不会丢日志？
+
+可能。使用 DropNewest 时队列满会丢。即使用 Block，如果进程崩溃或被 kill -9，内存队列中尚未落盘的日志也可能丢。所以异步日志只能降低开销，不能天然保证崩溃零丢失。需要 Flush、同步落盘或外部 WAL 才能增强保证。
+
+## 三、AsyncLogger 细节
+
+### 16. Log() 做了什么？
+
+`Log()` 是 producer 热路径。它先创建 `OperationGuard`，检查 logger 是否 running 和日志级别是否允许，然后填充 `QueueItem`，包括时间戳、等级、logger 名称、线程 ID、source location 和 payload，最后调用 `Publish()` 入队。
+
+### 17. 为什么先做日志级别过滤？
+
+低于当前等级的日志不需要构造 payload，也不需要入队。把过滤放在前面可以避免无意义的字符串拼接、时间戳、线程 ID 和队列操作，是日志库最基本的热路径优化。
+
+### 18. OperationGuard 是干什么的？
+
+`OperationGuard` 用 `active_operations_` 记录当前正在执行 logger 操作的 producer 数量。Stop 时 worker 不能只看 running 标志退出，还要等已经进入 Log 或 Flush 的线程完成，否则可能漏处理正在入队的消息。
+
+### 19. Publish() 怎么处理入队？
+
+它循环调用 `queue_.TryEnqueue()`。成功后更新 `wake_signal_` 并 notify worker。失败时如果是 DropNewest，就撤销 enqueued 计数并增加 dropped；如果是 Block，就先自旋、再 yield、再短暂 sleep，直到成功或 logger 停止。
+
+### 20. 为什么 Block 策略要 backoff？
+
+队列短暂满时，自旋可能很快等到 consumer 腾出槽位；如果一直满，持续自旋会浪费 CPU，所以后面逐步 yield 和 sleep。这是延迟和 CPU 使用之间的折中。
+
+### 21. Stats 的 pending 准确吗？
+
+`pending = enqueued - written` 是估算值。并发环境下统计项不是强一致快照，但足够用于观察积压趋势。严格队列长度需要额外原子计数，也会增加热路径开销。
+
+### 22. CurrentThreadId 为什么用 thread_local？
+
+`std::this_thread::get_id()` 和 hash 每次调用都有成本。日志热路径会频繁获取线程 ID，用 `thread_local` 缓存 hash 后，每个线程只计算一次，后续直接读取。
+
+## 四、无锁环形队列
+
+### 23. 队列的数据结构是什么？
+
+是一个有界环形数组，每个槽位 `Cell` 包含一个 `sequence` 和一个 `value`。全局有 `enqueue_pos_` 和 `dequeue_pos_` 两个原子游标。capacity 会向上取 2 的幂，用 `position & mask` 定位槽位。
+
+### 24. 为什么 capacity 要取 2 的幂？
+
+取 2 的幂后，环形数组下标可以用 `position & (capacity - 1)`，比取模更快，也更适合无锁队列的循环复用。
+
+### 25. sequence 是干什么的？
+
+sequence 表示槽位当前属于哪一轮、可写还是可读。因为环形数组会复用，同一个物理槽位会被不同全局 position 重复使用。sequence 能让 producer/consumer 判断该槽位是否属于自己当前处理的位置，避免回绕带来的状态混淆。
+
+### 26. TryEnqueue 怎么判断槽位可写？
+
+producer 读取 `enqueue_pos_` 得到 position，找到 `buffer_[position & mask_]`，读取 cell sequence。如果 `sequence - position == 0`，说明该槽位可写。producer 通过 CAS 抢占 enqueue position，抢占成功后写入 value，再把 sequence 设置为 `position + 1` 发布给 consumer。
+
+### 27. TryDequeue 怎么判断槽位可读？
+
+consumer 读取 `dequeue_pos_` 得到 position，读取对应 cell sequence。如果 `sequence - (position + 1) == 0`，说明 producer 已发布数据。consumer CAS 抢占 dequeue position，抢占成功后 move 出 value，再把 sequence 设置为 `position + capacity`，表示槽位进入下一轮可写状态。
+
+### 28. diff < 0 表示什么？
+
+入队时 `diff < 0` 表示该槽位还没有被 consumer 释放，队列满。出队时 `diff < 0` 表示该槽位还没有 producer 发布，队列空。
+
+### 29. 这个队列是 lock-free 还是 wait-free？
+
+它是 lock-free 风格，不是 wait-free。CAS 失败时线程会重试，某个线程不保证有限步完成，但整体系统在竞争中会有线程推进。wait-free 要求每个线程都在有限步内完成，要求更高。
+
+### 30. 无锁是不是一定比 mutex 快？
+
+不是。无锁在高并发竞争下通常能减少阻塞和内核调度，但在低并发、单线程或 I/O 主导场景下，mutex 可能足够快甚至更简单。无锁还会增加实现复杂度和调试成本，所以必须用 benchmark 验证。
+
+### 31. 为什么 enqueue_pos 和 dequeue_pos 要 alignas(64)？
+
+为了降低 false sharing。producer 高频修改 `enqueue_pos_`，consumer 高频修改 `dequeue_pos_`。如果两个原子落在同一个 cache line，会造成不必要的缓存失效。64 字节对齐可以让它们尽量分处不同 cache line。
+
+### 32. 这个队列有没有 ABA 问题？
+
+sequence 机制可以缓解环形槽位复用带来的 ABA 类问题。因为判断的不是单纯指针或布尔状态，而是单调递增的全局 sequence。槽位每轮复用都会增加 capacity，producer/consumer 能区分不同轮次。
+
+## 五、内存序
+
+### 33. 为什么 cell.sequence load 用 acquire？
+
+consumer 通过 acquire load 看到 producer 的 release store 后，才能保证看见 producer 在 release 前写入的 `cell.value`。反过来，producer 看到 consumer release 后的 sequence，也能安全复用槽位。
+
+### 34. 为什么 cell.sequence store 用 release？
+
+producer 写完 `cell.value` 后，用 release store 发布 sequence，保证 value 写入对 consumer 可见。consumer 读完 value 后，用 release store 标记槽位可写，保证槽位释放动作对 producer 可见。
+
+### 35. 为什么 position CAS 可以 relaxed？
+
+`enqueue_pos_` 和 `dequeue_pos_` 主要用于抢占位置，不直接发布 `value` 数据。真正的数据可见性由 cell sequence 的 acquire/release 保证。因此游标 CAS 用 relaxed 可以减少不必要的内存栅栏。
+
+### 36. 为什么不用 seq_cst？
+
+`seq_cst` 最强但成本更高，也不是所有地方都需要。这里的同步关系是局部的：producer 与 consumer 通过某个 cell 的 sequence 建立 happens-before。acquire/release 已经足够表达这个关系。
+
+### 37. 面试中怎么解释内存序？
+
+可以说：队列中有两类原子，一类是位置游标，只负责 CAS 抢占位置，所以 relaxed；另一类是槽位 sequence，负责发布和消费数据，所以使用 acquire/release。数据写入必须发生在 release 发布前，数据读取必须发生在 acquire 看到发布后。
+
+## 六、wait/notify 和后台线程
+
+### 38. 为什么用 atomic::wait/notify？
+
+`atomic::wait/notify` 可以基于原子变量等待变化，不需要额外 mutex + condition_variable。对于“队列为空时休眠，有新数据时唤醒”的场景更轻量，也和无锁队列设计更一致。
+
+### 39. 会不会漏唤醒？
+
+Worker 在读取 wake signal 后，进入 wait 前会再次尝试 `TryDequeue()`。如果这期间 producer 入队并 notify，第二次 TryDequeue 能发现数据，从而避免检查空队列和 wait 之间的竞态。
+
+### 40. WorkerLoop 怎么退出？
+
+worker drain 完队列后检查 `stopping_` 和 `active_operations_`。只有 Stop 已经发起，并且没有活跃 producer 操作时才退出。退出前还会调用一次 `sink_->Flush()`。
+
+### 41. 为什么 worker 要 drain 队列，而不是一条一条 wait？
+
+批量 drain 可以减少 wait/notify 次数，也更适合文件写入 batching。后台线程被唤醒后尽可能处理队列中的所有日志，能提高吞吐。
+
+### 42. HandleItem 做什么？
+
+如果 item 是 Flush 控制消息，就调用 `sink_->Flush()`，更新 flush complete ticket 并 notify 等待线程。如果是普通日志，就调用 `sink_->Write()`，增加 written 计数，并根据日志等级判断是否需要 flush。
+
+## 七、Flush 和 Stop
+
+### 43. Flush 为什么不直接调用 sink_->Flush()？
+
+sink 由后台线程写入。如果业务线程直接调用 sink flush，可能和后台线程并发访问 sink，破坏线程安全。正确做法是把 Flush 作为控制消息放进同一个队列，由后台线程按顺序处理。
+
+### 44. Flush 怎么保证之前日志都写完？
+
+Flush item 和普通日志在同一个队列中排队。worker 按出队顺序处理。当它处理到某个 flush ticket 时，说明这个 flush 之前入队的日志都已经处理过。然后 worker 调用 sink flush 并更新 complete ticket。
+
+### 45. 多个线程同时 Flush 怎么办？
+
+每个 Flush 都有递增 ticket。线程等待 `flush_complete_ticket_ >= 自己的 ticket`。worker 按队列顺序处理 flush item，完成后更新 ticket。这样多个 Flush 可以按 ticket 有序完成。
+
+### 46. Stop 怎么保证安全？
+
+Stop 用 CAS 保证停止流程只执行一次，设置 `running_ = false` 阻止新日志，唤醒 worker，然后 join。worker 会等队列 drain 且 active operations 为 0 再退出，最后 flush sink。
+
+### 47. 析构时会不会丢日志？
+
+正常析构会调用 Stop，Stop 会尽量 drain 队列并 flush。但如果进程崩溃、被 kill -9 或 sink 写入异常，仍可能丢日志。这是异步日志的通用边界。
+
+### 48. Stop 后再写日志会怎样？
+
+`Log()` 会检查 `running_`，Stop 后 running 为 false，新日志返回 false，不再入队。
+
+## 八、Payload 热路径
+
+### 49. 为什么要做 LogPayload？
+
+如果每条日志都用 `ostringstream` 拼成 `std::string`，会有格式化和堆分配开销。`LogPayload` 用 256B inline buffer 覆盖常见短日志，避免大多数短日志堆分配。
+
+### 50. 256B 是怎么考虑的？
+
+很多业务日志都比较短，包含固定文本加几个数字或 ID。256B 能覆盖大量常见日志，同时对象大小还可接受。它是工程折中值，不是绝对最优，可以根据 benchmark 和业务日志长度分布调整。
+
+### 51. 超过 256B 怎么办？
+
+`EnsureCapacity()` 会分配 heap storage，并按需要扩容。这样短日志走 inline 快路径，长日志仍然可用。
+
+### 52. 为什么整数用 std::to_chars？
+
+`std::to_chars` 不分配、不依赖 locale，直接写入栈上 buffer，比 iostream 更适合日志热路径。整数参数在日志中非常常见，所以收益明显。
+
+### 53. 浮点为什么还用 ostringstream？
+
+浮点格式化比整数复杂，`to_chars` 浮点支持和表现与编译器实现有关。当前项目先对最常见整数做热路径优化，对浮点和自定义 streamable 类型保留通用性，使用 `ostringstream`。
+
+### 54. bool 为什么输出 1/0？
+
+这是当前实现的简化选择，避免字符串分支和额外长度处理。如果要更可读，可以改成 `true/false`，但会多写几个字符。这个属于可配置格式问题。
+
+### 55. 不支持的类型怎么办？
+
+如果类型不是字符串类、数值类，也不能用 `operator<<` 输出，会触发编译期 static_assert。这比运行时报错更早暴露问题。
+
+## 九、Sink 和格式化
+
+### 56. Sink 抽象有什么好处？
+
+它把日志核心和输出目标解耦。AsyncLogger 只负责异步队列和生命周期，具体写到文件、控制台、轮转文件或多个目标由 sink 实现。用户也可以扩展自定义 sink。
+
+### 57. FileSink 怎么优化写文件？
+
+FileSink 不一定每条日志都立刻写出，而是先格式化到 `staging_buffer_`。当 buffer 超过 `max_batch_size` 或达到 `flush_interval` 时，再批量写文件并视情况 flush。这样可以减少小块写次数。
+
+### 58. FileSink batching 一定更快吗？
+
+不一定。真实文件 benchmark 受 OS cache、磁盘、文件系统、payload 大小和 flush 策略影响很大。batching 的设计目标是减少小写次数，但端到端结果需要 benchmark 验证。
+
+### 59. RotatingFileSink 有什么用？
+
+日志文件不能无限增长。RotatingFileSink 按大小轮转文件，避免单个日志文件过大。生产中还可以继续扩展保留数量、压缩、按时间轮转和清理策略。
+
+### 60. MultiSink 有什么用？
+
+同一条日志可以同时输出到多个目标，比如控制台和文件。MultiSink 把 fan-out 封装到 sink 层，AsyncLogger 不需要知道有几个输出目标。
+
+### 61. PatternFormatter 在哪里执行？
+
+格式化完整日志文本在 sink 写入时执行，也就是后台线程路径。这让 producer 热路径只构造 payload，不承担完整格式化成本。
+
+## 十、benchmark
+
+### 62. benchmark 为什么用内存 sink？
+
+为了隔离磁盘 I/O 干扰。如果要比较队列和线程同步开销，真实磁盘会让结果被文件系统和设备性能主导。内存 sink 可以更清楚地观察 mutex 队列和 lock-free 队列的差异。
+
+### 63. hlog_compare_benchmark 测什么？
+
+它在相似异步模型和内存 sink 下，对比 `mutex + condition_variable + deque` 和 `CAS lock-free ring buffer + atomic wait/notify`，主要回答队列同步路径的吞吐差异。
+
+### 64. hlog_latency_benchmark 测什么？
+
+它测 producer 侧单次 `Log()` 调用延迟，包括计时本身的开销。适合比较相对趋势，比如 lock-free 队列是否降低业务线程写日志耗时。
+
+### 65. hlog_payload_benchmark 测什么？
+
+它对比旧的 prebuilt string/ostringstream 路径和新的 variadic inline payload 路径，回答 payload 构造优化是否有效。
+
+### 66. hlog_file_sink_benchmark 测什么？
+
+它测试真实 FileSink 路径，对比非批量和批量写配置。这个 benchmark 更接近真实落盘，但也更受环境影响，不能过度解读单次结果。
+
+### 67. spdlog 对比怎么讲才严谨？
+
+可以说：在本项目的 benchmark 条件下，使用相似 producer payload、异步模型和内存 sink，HLog 的队列热路径表现更好。但 spdlog 是成熟库，功能更多，对比结果依赖配置和测试场景，不能简单说 HLog 全面替代 spdlog。
+
+### 68. 性能数据怎么引用？
+
+优先引用中位数、固定线程数、固定消息数和固定 warm-up/rounds。说明机器、编译器、sink 类型和 payload 大小。不要只拿最好一次结果。
+
+## 十一、工程和测试
+
+### 69. 怎么验证正确性？
+
+通过单元测试验证日志写入、flush、stop、drop 策略、sink 输出等行为；通过 sanitizer 检查内存和线程问题；通过 benchmark 验证性能趋势；通过 install smoke test 验证 CMake 安装导出和下游 `find_package` 可用。
+
+### 70. 为什么做 install/export？
+
+因为日志库应该被其他项目复用。CMake install/export 和 find_package consumer 能证明它不是只能在仓库内跑，而是能安装后被外部 CMake 项目链接。
+
+### 71. 日志库怎么接入其他项目？
+
+可以通过 CMake 安装后 `find_package(hlog)`，然后链接导出的 target。代码里创建 sink 和 AsyncLogger，或者通过 LoggerConfig 构建。后续也可以封装成包管理器形式，比如 Conan、vcpkg。
+
+### 72. 如果 sink 写入抛异常怎么办？
+
+当前实现的异常处理还比较基础。生产中需要明确策略：捕获异常并记录错误状态、调用错误回调、降级到 stderr、停止 logger 或丢弃后续日志。不能让后台线程异常无声退出。
+
+### 73. 如果后台线程卡住怎么办？
+
+队列会逐渐积压。Block 策略会反压业务线程，DropNewest 策略会开始丢日志。生产中应该暴露 pending、dropped、write error 等指标，并对 sink 卡顿做告警。
+
+### 74. 如果进程崩溃，Flush 有用吗？
+
+Flush 只对正常运行路径有用，能保证调用前入队日志被 worker 处理并 sink flush。但进程突然崩溃时，内存队列中的日志可能丢失；即使调用了 flush，是否真正落到磁盘还取决于文件系统和 fsync 策略。
+
+### 75. 为什么没有每条日志 fsync？
+
+每条 fsync 成本很高，会严重影响性能。日志库通常在性能和可靠性之间做权衡。关键审计日志可以使用更强同步策略，普通业务日志一般不会每条 fsync。
+
+## 十二、生产化追问
+
+### 76. 后续怎么增强？
+
+可以做：
+
+- 结构化 JSON 日志。
+- 动态日志级别。
+- 异常回调和错误指标。
+- 日志压缩和保留策略。
+- 时间轮转。
+- 多 consumer 或分片队列。
+- 异步网络 sink。
+- 配置热更新。
+- fsync 策略可配置。
+- 更完整的 pattern 语法。
+
+### 77. 多 consumer 会不会更快？
+
+不一定。多 consumer 可以提高格式化或网络输出吞吐，但文件顺序写会变复杂，还要处理日志顺序和 sink 线程安全。当前单 consumer 是为了简化顺序和 sink 访问。如果要多 consumer，适合按 logger、sink 或 shard 分区。
+
+### 78. 怎么保证日志顺序？
+
+当前队列按全局入队 position 排序，worker 单线程按出队顺序写出，因此能保持队列中的消费顺序。但多线程 producer 的真实调用先后在 CPU 层面没有绝对全局顺序，只能保证成功入队的线性化顺序。
+
+### 79. 日志时间戳在哪里取？
+
+当前在 producer 调用 Log 时取时间戳。这样时间更接近日志产生时间，而不是后台线程写出时间。代价是 producer 热路径多一次时间获取。
+
+### 80. 为什么 source location 用宏？
+
+C++20 有 `std::source_location`，但当前用宏可以直接携带 `__FILE__`、`__LINE__`、`__func__`，兼容简单明确。后续也可以改成 source_location API。
+
+### 81. 这个项目最容易被追问的风险点是什么？
+
+主要是无锁队列正确性和内存序。如果只说“用了 CAS 所以快”，会被继续问 sequence、acquire/release、ABA、false sharing、满队列策略和 Stop 竞态。准备时要把这些讲透。
+
+### 82. 你怎么证明不是过度优化？
+
+我通过 benchmark 把优化点拆开验证：队列同步对比 mutex 基线、producer latency、payload 构造对比、file sink 真实路径。每个 benchmark 都回答具体问题，而不是只给一个总吞吐数字。
+
+### 83. 如果低并发场景 mutex 更快怎么办？
+
+这是可能的。我的回答是：无锁队列主要优化高并发竞争场景；低并发下 mutex 方案更简单，也可能足够快。工程选择应该看场景和 benchmark，而不是无条件选择无锁。
+
+### 84. 你学到了什么？
+
+我学到日志库的难点不只是写文件，而是 producer 热路径、队列背压、后台线程生命周期、flush 语义、异常边界和性能验证。并发优化必须能解释正确性，也必须通过 benchmark 验证。
+
+## 十三、简历表达
+
+### 推荐写法一
+
+基于 C++20 实现高性能异步日志库，采用多生产者单消费者模型，业务线程经 CAS 有界无锁环形队列投递日志，后台线程批量消费并输出到 File/Console/Rotating/Multi Sink。
+
+### 推荐写法二
+
+设计 per-cell sequence 无锁 ring buffer，通过 acquire/release 内存序保证 producer-consumer 数据可见性，并结合 `atomic::wait/notify`、cache line 对齐和队列满 backoff 策略降低高并发日志写入竞争。
+
+### 推荐写法三
+
+优化 producer 热路径，实现 256B inline payload、整数 `std::to_chars` 追加和 `thread_local` 线程 ID 缓存；补充 Flush ticket 同步、Stop 安全退出、FileSink staging buffer、benchmark 报告和 CMake install/export。
+
+### 一句话收尾
+
+> HLog 的核心价值不是“能打印日志”，而是围绕高并发日志路径，把队列同步、payload 构造、后台消费、flush/stop 语义和性能验证做成了一个可复用 C++ 库。
