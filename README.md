@@ -4,6 +4,7 @@ HLog 是一个面向高并发场景的 C++20 异步日志库，核心热路径�
 
 ## 文档索引
 
+- [docs/README.md](docs/README.md)：文档导航和阅读顺序。
 - [docs/perf.md](docs/perf.md)：吞吐、调用延迟、payload 热路径和文件 sink benchmark 报告。
 - [docs/简历材料.md](docs/简历材料.md)：项目简历写法、亮点提炼和面试讲法。
 - [docs/project-study-guide-complete.md](docs/project-study-guide-complete.md)：完整学习路线、代码阅读顺序、架构拆解和生产化边界。
